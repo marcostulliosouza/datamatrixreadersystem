@@ -27,6 +27,7 @@ import numpy as np
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from PIL import Image, ImageTk
+from collections import deque
 
 from camera_controller import BaslerCameraController
 from decoder import DataMatrixDecoder, ImagePreprocessor
@@ -806,6 +807,9 @@ class ConfigPage(tk.Frame):
         self.app = app
         self.engine: Optional[Engine] = None
 
+        self._active = False
+        self._run_id = 0
+
         self.cam_exposure    = tk.IntVar(value=8000)
         self.fps_limit       = tk.IntVar(value=12)
         self.proc_every_n    = tk.IntVar(value=1)
@@ -880,12 +884,30 @@ class ConfigPage(tk.Frame):
         self._ui_job = None
         self._schedule_ui()
 
+        # logger simples
+        self._hist = []  # lista de (ts, tag, msg)
+        self._hist_max = 200
+
+    def _hist_add(self, tag: str, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._hist.append((ts, tag, msg))
+        if len(self._hist) > self._hist_max:
+            self._hist = self._hist[-self._hist_max:]
+
+    def _hist_dump(self):
+        with self._lock:
+            return "\n".join(self._hist)
+
     def on_hide(self):
         # para engine/camera
+        self._active = False
+        self._run_id += 1
         self.stop_engine()
 
     def stop_engine(self):
         eng = self.engine
+        self._active = False
+        self._run_id += 1
         if not eng:
             return
 
@@ -902,9 +924,12 @@ class ConfigPage(tk.Frame):
         self.engine = None
         self.btn_start.config(bg=GREEN)
         self.btn_stop.config(bg=BORDER_LT)
+
     # ── SHOW ────────────────────────────────────────────────────
     def on_show(self):
         # atualiza label CMC conforme estado global
+        self._active = True
+        self._run_id += 1
         cmc = self.app.state.cmc
         if cmc and self.app.state.cmc_ready:
             self.lbl_cmc.config(text="CMC: logado", fg=GREEN)
@@ -1005,7 +1030,23 @@ class ConfigPage(tk.Frame):
         self._build_trigger_section()
         self._build_decode_section()
         self._build_cmc_section()
+
+        hist_body = _section(self.sidebar, "HISTÓRICO")
+        self.txt_hist = tk.Text(hist_body, height=8, bg=BG_CARD, fg=TEXT_SEC,
+                                font=FONT_MONO, relief="flat",
+                                insertbackground=ACCENT, state="disabled")
+        self.txt_hist.pack(fill="x")
         tk.Frame(self.sidebar, bg=BG_DEEP, height=24).pack()
+
+    def _hist_refresh_text(self):
+        if not hasattr(self, "txt_hist"):
+            return
+        self.txt_hist.config(state="normal")
+        self.txt_hist.delete("1.0", "end")
+        for ts, tag, msg in self._hist[-120:]:
+            self.txt_hist.insert("end", f"[{ts}] {tag}: {msg}\n")
+        self.txt_hist.config(state="disabled")
+        self.txt_hist.see("end")
 
     def _build_status_card(self):
         c = tk.Frame(self.sidebar, bg=BG_CARD,
@@ -1180,6 +1221,8 @@ class ConfigPage(tk.Frame):
     def start_engine(self):
         if self.engine:
             return
+        self._active = True
+        self._run_id += 1
         self.engine = self._make_engine()
         self._apply_aoi()
         if not self.engine.start(exposure_us=int(self.cam_exposure.get())):
@@ -1189,13 +1232,13 @@ class ConfigPage(tk.Frame):
         self.btn_start.config(bg=TEXT_DIM)
         self.btn_stop.config(bg=RED)
 
-    def stop_engine(self):
-        if not self.engine:
-            return
-        self.engine.stop()
-        self.engine = None
-        self.btn_start.config(bg=GREEN)
-        self.btn_stop.config(bg=BORDER_LT)
+    # def stop_engine(self):
+    #     if not self.engine:
+    #         return
+    #     self.engine.stop()
+    #     self.engine = None
+    #     self.btn_start.config(bg=GREEN)
+    #     self.btn_stop.config(bg=BORDER_LT)
 
     def rearm(self):
         if self.engine:
@@ -1242,29 +1285,59 @@ class ConfigPage(tk.Frame):
 
     def _cb_trigger(self, codes, dbg_img, passed, dec_ms):
         with self._lock:
-            self._shared["codes"]     = codes
+            self._shared["codes"] = codes
             self._shared["debug_img"] = dbg_img
-            self._shared["passed"]    = passed
-            self._shared["dec_ms"]    = dec_ms
+            self._shared["passed"] = passed
+            self._shared["dec_ms"] = dec_ms
+            self._shared["total"] += 1
+            if passed:
+                self._shared["ok_count"] += 1
+            else:
+                self._shared["fail_count"] += 1
 
-        self.app.state.last_passed    = passed
-        self.app.state.last_codes     = codes
-        self.app.state.last_debug_img = dbg_img
-
-        # ✅ FIX: decoded definido
         decoded = [r.get("text") for r in codes if r.get("text")]
-        cmc = self.app.state.cmc
+        self._hist_add("TRG", f"{'PASS' if passed else 'FAIL'} | codes={len(decoded)} | {dec_ms:.0f}ms")
+        self.after(0, self._hist_refresh_text)
 
-        if self.cmc_enabled.get() and decoded and cmc:
-            def _ap():
-                try:
-                    cmc.ensure_login(timeout_s=15)
-                    payload = decoded if self.cmc_batch.get() else decoded[0]
-                    cmc.apontar(payload, timeout_s=15)
-                    self.after(0, lambda: self.lbl_cmc.config(text="CMC: OK", fg=GREEN))
-                except Exception:
-                    self.after(0, lambda: self.lbl_cmc.config(text="CMC: ERRO", fg=RED))
-            threading.Thread(target=_ap, daemon=True).start()
+        cmc = self.app.state.cmc
+        if not (self.cmc_enabled.get() and decoded and cmc):
+            return
+
+        # ✅ congela payload (evita corrida)
+        payload = list(decoded) if self.cmc_batch.get() else str(decoded[0])
+        payload_preview = payload if isinstance(payload, str) else (str(payload)[:80] + "...")
+
+        def _ap(payload_local):
+            # não faz nada se a tela já parou
+            if not self._active:
+                return
+
+            self.after(0, lambda: self._hist_add("CMC", f"→ Enviando: {payload_preview}"))
+
+            try:
+                cmc.ensure_login(timeout_s=15)
+                if not self._active:
+                    return
+
+                resp = cmc.apontar(payload_local, timeout_s=15)  # ideal: retornar dict
+                if not self._active:
+                    return
+
+                status = (resp or {}).get("status", "SEM_STATUS")
+                log = (resp or {}).get("log", "")
+
+                if status == "OK":
+                    self.after(0, lambda: self._hist_add("CMC", f"✅ OK | serial={payload_preview}"))
+                else:
+                    self.after(0, lambda: self._hist_add("CMC", f"❌ {status}: {log} | serial={payload_preview}"))
+
+            except Exception as e:
+                msg = str(e)[:180]
+                self.after(0, lambda: self._hist_add("CMC", f"❌ Exceção: {msg} | serial={payload_preview}"))
+            finally:
+                self.after(0, self._hist_refresh_text)
+
+        threading.Thread(target=_ap, args=(payload,), daemon=True).start()
 
     def _cb_occupancy(self, occ, has_bg, present):
         with self._lock:
@@ -1682,6 +1755,9 @@ class ProductionPage(tk.Frame):
         self.cmc_enabled = tk.BooleanVar(value=True)
         self.cmc_batch   = tk.BooleanVar(value=True)
 
+        self._active = False
+        self._run_id = 0
+
         self._engine: Optional[Engine] = None
         self._lock = threading.Lock()
         self._shared: Dict[str, Any] = {
@@ -1698,11 +1774,33 @@ class ProductionPage(tk.Frame):
         self._build()
         self._ui_job = self.after(40, self._schedule_ui)
 
+        self._hist = deque(maxlen=600)
+
+    def _hist_add(self, level: str, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] [{level}] {msg}"
+        with self._lock:
+            self._hist.append(line)
+
+    def _hist_refresh_text(self):
+        with self._lock:
+            text = "\n".join(self._hist)
+
+        self.txt_hist.config(state="normal")
+        self.txt_hist.delete("1.0", "end")
+        self.txt_hist.insert("end", text + ("\n" if text else ""))
+        self.txt_hist.config(state="disabled")
+        self.txt_hist.see("end")
+
     def on_hide(self):
+        self._active = False
+        self._run_id += 1
         self.stop_prod()
 
     def stop_prod(self):
         eng = self._engine
+        self._active = False
+        self._run_id += 1
         if not eng:
             return
 
@@ -1938,14 +2036,9 @@ class ProductionPage(tk.Frame):
             return
         self._engine = self._build_engine_from_project()
         if self._engine:
+            self._active = True
+            self._run_id += 1
             self._cam_dot.config(fg=GREEN)
-
-    def stop_prod(self):
-        if not self._engine:
-            return
-        self._engine.stop()
-        self._engine = None
-        self._cam_dot.config(fg=MUTED)
 
     def rearm(self):
         if self._engine:
@@ -1962,28 +2055,62 @@ class ProductionPage(tk.Frame):
 
     def _cb_trigger(self, codes, dbg_img, passed, dec_ms):
         with self._lock:
-            self._shared["codes"]     = codes
+            self._shared["codes"] = codes
             self._shared["debug_img"] = dbg_img
-            self._shared["passed"]    = passed
-            self._shared["dec_ms"]    = dec_ms
-            self._shared["total"]    += 1
+            self._shared["passed"] = passed
+            self._shared["dec_ms"] = dec_ms
+            self._shared["total"] += 1
             if passed:
                 self._shared["ok_count"] += 1
             else:
                 self._shared["fail_count"] += 1
 
         decoded = [r.get("text") for r in codes if r.get("text")]
-        cmc = self.app.state.cmc
+        self._hist_add("TRG", f"{'PASS' if passed else 'FAIL'} | codes={len(decoded)} | {dec_ms:.0f}ms")
+        self.after(0, self._hist_refresh_text)
 
-        if self.cmc_enabled.get() and decoded and cmc:
-            def _ap():
-                try:
-                    cmc.ensure_login(timeout_s=15)
-                    payload = decoded if self.cmc_batch.get() else decoded[0]
-                    cmc.apontar(payload, timeout_s=15)
-                except Exception:
-                    pass
-            threading.Thread(target=_ap, daemon=True).start()
+        cmc = self.app.state.cmc
+        if not (self._active and self.cmc_enabled.get() and decoded and cmc):
+            return
+
+        run_id = self._run_id  # ✅ trava sessão
+
+        payload = list(decoded) if self.cmc_batch.get() else str(decoded[0])
+
+        # log antes de apontar (mostra serial mesmo)
+        if isinstance(payload, list):
+            self._hist_add("CMC", f"→ Enviando batch ({len(payload)}): {payload[0][:40]}...")
+        else:
+            self._hist_add("CMC", f"→ Enviando: {payload}")
+        self.after(0, self._hist_refresh_text)
+
+        def _ap(payload_local):
+            if (not self._active) or (self._run_id != run_id) or (self._engine is None):
+                return
+            try:
+                cmc.ensure_login(timeout_s=15)
+                if (not self._active) or (self._run_id != run_id) or (self._engine is None):
+                    return
+
+                resp = cmc.apontar(payload_local, timeout_s=15)  # precisa retornar dict
+                if (not self._active) or (self._run_id != run_id) or (self._engine is None):
+                    return
+
+                status = (resp or {}).get("status", "SEM_STATUS")
+                log = (resp or {}).get("log", "")
+
+                if status == "OK":
+                    self.after(0, lambda: self._hist_add("CMC", f"✅ OK | serial={payload_local}"))
+                else:
+                    self.after(0, lambda: self._hist_add("CMC", f"❌ {status}: {log} | serial={payload_local}"))
+
+            except Exception as e:
+                msg = str(e)[:180]
+                self.after(0, lambda: self._hist_add("CMC", f"❌ Exceção: {msg} | serial={payload_local}"))
+            finally:
+                self.after(0, self._hist_refresh_text)
+
+        threading.Thread(target=_ap, args=(payload,), daemon=True).start()
 
     def _cb_occupancy(self, occ, has_bg, present):
         with self._lock:
