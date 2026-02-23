@@ -591,6 +591,10 @@ class Engine:
         self.fps_limit = 12
         self.process_every_n = 1
 
+        # Delay antes do trigger (para evitar borrão/esteira)
+        self.trigger_delay_ms = 0
+        self._present_since = None
+
     def start(self, exposure_us: int = 8000) -> bool:
         if self._thread and self._thread.is_alive():
             return True
@@ -695,29 +699,63 @@ class Engine:
 
     def _make_tile(self, r, size=(360, 440)):
         w, h = size
-        img = np.zeros((h, w, 3), np.uint8); img[:] = (15, 15, 15)
-        cv2.rectangle(img, (0,0), (w-1, 44), (0, 0, 140), -1)
-        ok = bool(r["text"])
-        cv2.putText(img, f"ROI {r['roi_id']}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255,255,255), 2)
+
+        img = np.zeros((h, w, 3), np.uint8)
+        img[:] = (15, 15, 15)
+
+        cv2.rectangle(img, (0, 0), (w - 1, 44), (0, 0, 140), -1)
+
+        ok = bool(r.get("text"))
+        cv2.putText(img, f"ROI {r.get('roi_id', '?')}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
         cv2.putText(img, "OK" if ok else "NOK", (10, 72),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.85,
-                    (0,220,0) if ok else (0,0,255), 2)
-        gray = r.get("proc") if r.get("proc") is not None else r.get("raw")
+                    (0, 220, 0) if ok else (0, 0, 255), 2)
+
+        # pega imagem de preview (proc > raw)
+        gray = r.get("proc")
+        if gray is None:
+            gray = r.get("raw")
+
         if isinstance(gray, np.ndarray) and gray.size > 0:
-            if gray.ndim != 2:
-                gray = gray[:,:,0] if gray.ndim==3 else gray
-            th = h - 110
-            sc = th / max(1, gray.shape[0])
-            nw = int(gray.shape[1]*sc); nh = int(gray.shape[0]*sc)
-            if nw>4 and nh>4:
-                g2 = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_NEAREST)
-                g2 = cv2.cvtColor(g2, cv2.COLOR_GRAY2BGR)
-                x0 = (w-nw)//2; y0 = 100
-                img[y0:y0+nh, x0:x0+nw] = g2
-        if r["text"]:
-            cv2.putText(img, r["text"][:26], (10, h-14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,220,0), 1)
+            # garante 2D
+            if gray.ndim == 3:
+                gray = gray[:, :, 0]
+            elif gray.ndim != 2:
+                gray = np.squeeze(gray)
+                if gray.ndim != 2:
+                    gray = None
+
+        if isinstance(gray, np.ndarray) and gray.size > 0:
+            # área disponível no tile
+            avail_h = h - 110
+            avail_w = w - 20  # margem lateral
+
+            gh, gw = gray.shape[:2]
+            if gh > 0 and gw > 0:
+                sc = min(avail_h / gh, avail_w / gw)  # cabe em altura e largura
+                nw = max(1, int(gw * sc))
+                nh = max(1, int(gh * sc))
+
+                if nw >= 4 and nh >= 4:
+                    g2 = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_NEAREST)
+                    g2 = cv2.cvtColor(g2, cv2.COLOR_GRAY2BGR)
+
+                    x0 = max(0, (w - nw) // 2)
+                    y0 = 100
+
+                    # corte defensivo
+                    x1 = min(w, x0 + nw)
+                    y1 = min(h, y0 + nh)
+                    g2 = g2[:(y1 - y0), :(x1 - x0)]
+
+                    img[y0:y1, x0:x1] = g2
+
+        txt = r.get("text")
+        if txt:
+            cv2.putText(img, str(txt)[:26], (10, h - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 0), 1)
+
         return img
 
     @staticmethod
@@ -762,24 +800,60 @@ class Engine:
                 if cb_occ and not self._stop_evt.is_set():
                     cb_occ(occ, hasbg, present)
 
-                if self.state == "WAIT_PRESENT" and present:
-                    self.state = "TRIGGERED"
-                    cb_state = self.on_state_change
-                    if cb_state and not self._stop_evt.is_set():
-                        cb_state(self.state)
+                delay_s = max(0.0, float(getattr(self, "trigger_delay_ms", 0)) / 1000.0)
 
-                    self._fire_trigger(frame)
+                if self.state == "WAIT_PRESENT":
+                    if present:
+                        # entrou presente → marca início e vai aguardar estabilizar
+                        self._present_since = time.time()
+                        self.state = "WAIT_STABLE" if delay_s > 0 else "TRIGGERED"
 
-                    self.state = "WAIT_CLEAR"
-                    cb_state = self.on_state_change
-                    if cb_state and not self._stop_evt.is_set():
-                        cb_state(self.state)
+                        cb_state = self.on_state_change
+                        if cb_state and not self._stop_evt.is_set():
+                            cb_state(self.state)
+
+                        if delay_s <= 0:
+                            # sem delay: dispara imediatamente
+                            self._fire_trigger(frame)
+                            self.state = "WAIT_CLEAR"
+                            cb_state = self.on_state_change
+                            if cb_state and not self._stop_evt.is_set():
+                                cb_state(self.state)
+                    else:
+                        self._present_since = None
+
+                elif self.state == "WAIT_STABLE":
+                    if not present:
+                        # perdeu presença antes de estabilizar → cancela
+                        self._present_since = None
+                        self.state = "WAIT_PRESENT"
+                        cb_state = self.on_state_change
+                        if cb_state and not self._stop_evt.is_set():
+                            cb_state(self.state)
+                    else:
+                        # ainda presente → espera completar delay
+                        if self._present_since is None:
+                            self._present_since = time.time()
+                        if (time.time() - self._present_since) >= delay_s:
+                            self.state = "TRIGGERED"
+                            cb_state = self.on_state_change
+                            if cb_state and not self._stop_evt.is_set():
+                                cb_state(self.state)
+
+                            self._fire_trigger(frame)
+
+                            self.state = "WAIT_CLEAR"
+                            cb_state = self.on_state_change
+                            if cb_state and not self._stop_evt.is_set():
+                                cb_state(self.state)
 
                 elif self.state == "WAIT_CLEAR" and not present:
+                    self._present_since = None
                     self.state = "WAIT_PRESENT"
                     cb_state = self.on_state_change
                     if cb_state and not self._stop_evt.is_set():
                         cb_state(self.state)
+
 
             dt = time.time() - t0
             times.append(dt)
@@ -806,6 +880,9 @@ class ConfigPage(tk.Frame):
         super().__init__(parent, bg=BG_DEEP)
         self.app = app
         self.engine: Optional[Engine] = None
+        self._loaded_bg = None
+
+        self.trigger_delay_ms = tk.IntVar(value=150)
 
         self._active = False
         self._run_id = 0
@@ -872,6 +949,7 @@ class ConfigPage(tk.Frame):
             "occ": 0.0, "has_bg": False, "present": False,
             "codes": [], "debug_img": None,
             "passed": None, "state": "WAIT_PRESENT",
+            "total": 0, "ok_count": 0, "fail_count": 0
         }
         self._img_orig_tk = None
         self._img_dbg_tk  = None
@@ -1121,6 +1199,8 @@ class ConfigPage(tk.Frame):
              style="ghost", padx=10, pady=6).pack(side="right", fill="x", expand=True)
 
     def _build_trigger_section(self):
+
+
         body = _section(self.sidebar, "TRIGGER  ·  AOI")
 
         aoi_row = tk.Frame(body, bg=BG_CARD)
@@ -1152,6 +1232,10 @@ class ConfigPage(tk.Frame):
         _spin(r2, self.deb_on, 1, 30, width=4).pack(side="left")
         _lbl(r2, "OFF:").pack(side="left", padx=(10,4))
         _spin(r2, self.deb_off, 1, 60, width=4).pack(side="left")
+
+        r3 = _row(body)
+        _lbl(r3, "Delay trigger (ms):").pack(side="left", padx=(0,4))
+        _spin(r3, self.trigger_delay_ms, 0, 2000, width=6, inc=10).pack(side="left")
 
     def _build_decode_section(self):
         body = _section(self.sidebar, "DECODE")
@@ -1187,6 +1271,8 @@ class ConfigPage(tk.Frame):
         eng.on_occupancy       = self._cb_occupancy
         eng.on_state_change    = self._cb_state
 
+        eng.trigger_delay_ms = int(self.trigger_delay_ms.get())
+
         self.app.state.camera  = camera
         self.app.state.decoder = decoder
         self.app.state.panel_detector = pd
@@ -1221,6 +1307,14 @@ class ConfigPage(tk.Frame):
     def start_engine(self):
         if self.engine:
             return
+        self.engine = self._make_engine()
+        self._apply_aoi()
+
+        if self._loaded_bg is not None:
+            self.engine.panel_detector._bg = self._loaded_bg
+            self.engine.panel_detector.last_debug["has_bg"] = True
+            with self._lock:
+                self._shared["has_bg"] = True
         self._active = True
         self._run_id += 1
         self.engine = self._make_engine()
@@ -1270,9 +1364,9 @@ class ConfigPage(tk.Frame):
 
         eng = self.engine
         if not eng:
-            return  # ✅ se parou no meio, sai sem mexer
+            return
 
-        # atualiza runtime params
+        eng.trigger_delay_ms = int(self.trigger_delay_ms.get())
         eng.fps_limit = int(self.fps_limit.get())
         eng.process_every_n = int(self.proc_every_n.get())
         eng.rois = self.rois
@@ -1296,44 +1390,64 @@ class ConfigPage(tk.Frame):
                 self._shared["fail_count"] += 1
 
         decoded = [r.get("text") for r in codes if r.get("text")]
+        decoded = list(dict.fromkeys(decoded))  # evita duplicados mantendo ordem
+
         self._hist_add("TRG", f"{'PASS' if passed else 'FAIL'} | codes={len(decoded)} | {dec_ms:.0f}ms")
         self.after(0, self._hist_refresh_text)
 
         cmc = self.app.state.cmc
-        if not (self.cmc_enabled.get() and decoded and cmc):
+        if not (self._active and self.cmc_enabled.get() and decoded and cmc):
             return
 
-        # ✅ congela payload (evita corrida)
+        run_id = self._run_id  # trava a sessão (evita thread antiga escrevendo depois)
+
+        # só pra log/UI
         payload = list(decoded) if self.cmc_batch.get() else str(decoded[0])
-        payload_preview = payload if isinstance(payload, str) else (str(payload)[:80] + "...")
+
+        if isinstance(payload, list):
+            preview = f"{len(payload)} seriais (1 a 1): {payload[0][:40]}..."
+            self._hist_add("CMC", f"→ Enviando {preview}")
+        else:
+            self._hist_add("CMC", f"→ Enviando 1 serial: {payload}")
+        self.after(0, self._hist_refresh_text)
 
         def _ap(payload_local):
-            # não faz nada se a tela já parou
-            if not self._active:
+            if (not self._active) or (self._run_id != run_id):
                 return
-
-            self.after(0, lambda: self._hist_add("CMC", f"→ Enviando: {payload_preview}"))
 
             try:
                 cmc.ensure_login(timeout_s=15)
-                if not self._active:
+                if (not self._active) or (self._run_id != run_id):
                     return
 
-                resp = cmc.apontar(payload_local, timeout_s=15)  # ideal: retornar dict
-                if not self._active:
-                    return
+                seriais = payload_local if isinstance(payload_local, list) else [payload_local]
 
-                status = (resp or {}).get("status", "SEM_STATUS")
-                log = (resp or {}).get("log", "")
+                for serial in seriais:
+                    if (not self._active) or (self._run_id != run_id):
+                        return
 
-                if status == "OK":
-                    self.after(0, lambda: self._hist_add("CMC", f"✅ OK | serial={payload_preview}"))
-                else:
-                    self.after(0, lambda: self._hist_add("CMC", f"❌ {status}: {log} | serial={payload_preview}"))
+                    # se seu CmControlMqttClient não for thread-safe, use um lock:
+                    # with self._cmc_lock:
+                    resp = cmc.apontar(serial, timeout_s=15)
+
+                    status = (resp or {}).get("status", "SEM_STATUS")
+                    log = (resp or {}).get("log", "")
+
+                    if status == "OK":
+                        self.after(0, lambda s=serial: self._hist_add("CMC", f"✅ OK | serial={s}"))
+                    else:
+                        self.after(
+                            0,
+                            lambda s=serial, st=status, lg=log:
+                            self._hist_add("CMC", f"❌ {st}: {lg} | serial={s}")
+                        )
+
+                    # opcional: delay pra não saturar broker/API
+                    # time.sleep(0.05)
 
             except Exception as e:
                 msg = str(e)[:180]
-                self.after(0, lambda: self._hist_add("CMC", f"❌ Exceção: {msg} | serial={payload_preview}"))
+                self.after(0, lambda m=msg: self._hist_add("CMC", f"❌ Exceção: {m}"))
             finally:
                 self.after(0, self._hist_refresh_text)
 
@@ -1358,6 +1472,9 @@ class ConfigPage(tk.Frame):
                 ok, buf = cv2.imencode(".png", bg)
                 if ok:
                     bg64 = base64.b64encode(buf.tobytes()).decode()
+            if bg64 is None and self.app.state.project_data:
+                bg64 = self.app.state.project_data.get("background_base64_png")
+
         return {
             "project_name": self._project_name,
             "saved_at": datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
@@ -1410,16 +1527,16 @@ class ConfigPage(tk.Frame):
                                  h=float(r["h"]),  angle=float(r.get("angle",0))))
 
         bg64 = data.get("background_base64_png")
-        if bg64 and self.engine:
+        self._loaded_bg = None
+        if bg64:
             try:
-                b = base64.b64decode(bg64.encode())
+                b = base64.b64decode(bg64)
                 arr = np.frombuffer(b, np.uint8)
                 bg = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
                 if bg is not None:
-                    self.engine.panel_detector._bg = bg
-                    self.engine.panel_detector.last_debug["has_bg"] = True
+                    self._loaded_bg = bg
             except Exception:
-                pass
+                self._loaded_bg = None
 
         self.lbl_project.config(text=f"● {self._project_name}", fg=ACCENT)
         self.app.state.project_data = data
@@ -1692,11 +1809,17 @@ class ConfigPage(tk.Frame):
 
         # draw original
         if frame is not None:
-            draw = self._frozen_frame if self.freeze.get() else frame
-            if not self.freeze.get():
-                self._frozen_frame = None
-            orig = cv2.cvtColor(draw, cv2.COLOR_GRAY2BGR) \
-                if draw.ndim == 2 else draw.copy()
+            if frame is not None:
+                if self.freeze.get():
+                    if self._frozen_frame is None:
+                        self._frozen_frame = frame.copy()
+                    draw = self._frozen_frame
+                else:
+                    draw = frame
+                    self._frozen_frame = None
+
+                # ✅ agora draw nunca será None aqui
+                orig = cv2.cvtColor(draw, cv2.COLOR_GRAY2BGR) if draw.ndim == 2 else draw.copy()
 
             # AOI overlay (fixa)
             ax, ay, aw, ah = (int(self.aoi_x.get()), int(self.aoi_y.get()),
@@ -2010,14 +2133,11 @@ class ProductionPage(tk.Frame):
 
         bg64 = data.get("background_base64_png")
         if bg64:
-            try:
-                arr = np.frombuffer(base64.b64decode(bg64), np.uint8)
-                bg = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-                if bg is not None:
-                    pd._bg = bg
-                    pd.last_debug["has_bg"] = True
-            except Exception:
-                pass
+            arr = np.frombuffer(base64.b64decode(bg64), np.uint8)
+            bg = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+            if bg is not None:
+                pd._bg = bg
+                pd.last_debug["has_bg"] = True
 
         eng.on_frame          = self._cb_frame
         eng.on_trigger_result = self._cb_trigger
@@ -2066,22 +2186,21 @@ class ProductionPage(tk.Frame):
                 self._shared["fail_count"] += 1
 
         decoded = [r.get("text") for r in codes if r.get("text")]
-        self._hist_add("TRG", f"{'PASS' if passed else 'FAIL'} | codes={len(decoded)} | {dec_ms:.0f}ms")
-        self.after(0, self._hist_refresh_text)
+        decoded = list(dict.fromkeys(decoded))  # evita duplicados mantendo ordem
 
         cmc = self.app.state.cmc
         if not (self._active and self.cmc_enabled.get() and decoded and cmc):
             return
 
-        run_id = self._run_id  # ✅ trava sessão
+        run_id = self._run_id
 
+        # só pra log/UI
         payload = list(decoded) if self.cmc_batch.get() else str(decoded[0])
 
-        # log antes de apontar (mostra serial mesmo)
         if isinstance(payload, list):
-            self._hist_add("CMC", f"→ Enviando batch ({len(payload)}): {payload[0][:40]}...")
+            self._hist_add("CMC", f"→ Enviando {len(payload)} seriais (1 a 1): {payload[0][:40]}...")
         else:
-            self._hist_add("CMC", f"→ Enviando: {payload}")
+            self._hist_add("CMC", f"→ Enviando 1 serial: {payload}")
         self.after(0, self._hist_refresh_text)
 
         def _ap(payload_local):
@@ -2092,21 +2211,29 @@ class ProductionPage(tk.Frame):
                 if (not self._active) or (self._run_id != run_id) or (self._engine is None):
                     return
 
-                resp = cmc.apontar(payload_local, timeout_s=15)  # precisa retornar dict
-                if (not self._active) or (self._run_id != run_id) or (self._engine is None):
-                    return
+                seriais = payload_local if isinstance(payload_local, list) else [payload_local]
 
-                status = (resp or {}).get("status", "SEM_STATUS")
-                log = (resp or {}).get("log", "")
+                for serial in seriais:
+                    if (not self._active) or (self._run_id != run_id) or (self._engine is None):
+                        return
 
-                if status == "OK":
-                    self.after(0, lambda: self._hist_add("CMC", f"✅ OK | serial={payload_local}"))
-                else:
-                    self.after(0, lambda: self._hist_add("CMC", f"❌ {status}: {log} | serial={payload_local}"))
+                    resp = cmc.apontar(serial, timeout_s=15)
+
+                    status = (resp or {}).get("status", "SEM_STATUS")
+                    log = (resp or {}).get("log", "")
+
+                    if status == "OK":
+                        self.after(0, lambda s=serial: self._hist_add("CMC", f"✅ OK | serial={s}"))
+                    else:
+                        self.after(0, lambda s=serial, st=status, lg=log:
+                        self._hist_add("CMC", f"❌ {st}: {lg} | serial={s}"))
+
+                    # opcional: pequeno delay pra não saturar (ajuste se precisar)
+                    # time.sleep(0.05)
 
             except Exception as e:
                 msg = str(e)[:180]
-                self.after(0, lambda: self._hist_add("CMC", f"❌ Exceção: {msg} | serial={payload_local}"))
+                self.after(0, lambda m=msg: self._hist_add("CMC", f"❌ Exceção: {m}"))
             finally:
                 self.after(0, self._hist_refresh_text)
 
