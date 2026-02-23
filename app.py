@@ -1289,50 +1289,63 @@ class ConfigPage(tk.Frame):
         }
 
     def _apply_aoi(self):
-        if not self.engine:
-            return
-        x = int(self.aoi_x.get()); y = int(self.aoi_y.get())
-        w = int(self.aoi_w.get()); h = int(self.aoi_h.get())
-        if w > 0 and h > 0:
-            self.engine.panel_detector.set_aoi(x, y, w, h)
+        x = int(self.aoi_x.get())
+        y = int(self.aoi_y.get())
+        w = int(self.aoi_w.get())
+        h = int(self.aoi_h.get())
+
+        if self.engine:
+            # detecta AOI antiga vs nova antes de aplicar
+            old_aoi = tuple(getattr(self.engine.panel_detector, "aoi", (0, 0, 0, 0)))
+            new_aoi = (x, y, w, h)
+
+            if w > 0 and h > 0:
+                self.engine.panel_detector.set_aoi(x, y, w, h)
+
+            # ✅ se AOI mudou, BG salvo fica inválido
+            if new_aoi != old_aoi:
+                self._loaded_bg = None
+                with self._lock:
+                    self._shared["has_bg"] = False
+
+        # params
         try:
-            p = self.engine.panel_detector.params
-            p.diff_threshold     = int(self.diff_thr.get())
-            p.occupancy_threshold= float(self.occ_thr.get())
-            p.debounce_on        = int(self.deb_on.get())
-            p.debounce_off       = int(self.deb_off.get())
+            if self.engine:
+                p = self.engine.panel_detector.params
+                p.diff_threshold = int(self.diff_thr.get())
+                p.occupancy_threshold = float(self.occ_thr.get())
+                p.debounce_on = int(self.deb_on.get())
+                p.debounce_off = int(self.deb_off.get())
         except Exception:
             pass
 
     def start_engine(self):
         if self.engine:
             return
-        self.engine = self._make_engine()
-        self._apply_aoi()
 
-        if self._loaded_bg is not None:
-            self.engine.panel_detector._bg = self._loaded_bg
-            self.engine.panel_detector.last_debug["has_bg"] = True
-            with self._lock:
-                self._shared["has_bg"] = True
         self._active = True
         self._run_id += 1
-        self.engine = self._make_engine()
+
+        eng = self._make_engine()
+        self.engine = eng
+
+        # aplica AOI/parametros
         self._apply_aoi()
-        if not self.engine.start(exposure_us=int(self.cam_exposure.get())):
+
+        # aplica BG carregado do projeto (se existir)
+        if self._loaded_bg is not None:
+            eng.panel_detector.set_background_gray(self._loaded_bg)
+            with self._lock:
+                self._shared["has_bg"] = True
+
+        # inicia câmera/loop
+        if not eng.start(exposure_us=int(self.cam_exposure.get())):
             messagebox.showerror("Erro", "Falha ao conectar câmera!")
             self.engine = None
             return
+
         self.btn_start.config(bg=TEXT_DIM)
         self.btn_stop.config(bg=RED)
-
-    # def stop_engine(self):
-    #     if not self.engine:
-    #         return
-    #     self.engine.stop()
-    #     self.engine = None
-    #     self.btn_start.config(bg=GREEN)
-    #     self.btn_stop.config(bg=BORDER_LT)
 
     def rearm(self):
         if self.engine:
@@ -1347,11 +1360,17 @@ class ConfigPage(tk.Frame):
         if frame is None:
             messagebox.showwarning("BG", "Sem frame da câmera.")
             return
+
         self._apply_aoi()
         ok = self.engine.panel_detector.capture_background(frame)
+
         with self._lock:
             self._shared["has_bg"] = ok
+
         if ok:
+            # guarda BG na ConfigPage para salvar mesmo se engine parar
+            self._loaded_bg = self.engine.panel_detector.get_background_gray()
+
             messagebox.showinfo("BG", "✅ Background capturado.")
         else:
             messagebox.showwarning("BG", "Falha. Verifique AOI.")
@@ -1466,14 +1485,24 @@ class ConfigPage(tk.Frame):
     # ── Project save/load ────────────────────────────────────────
     def _project_dict(self) -> dict:
         bg64 = None
+
+        # 1) tenta pegar bg do engine
+        bg = None
         if self.engine and self.engine.panel_detector.has_background():
-            bg = self.engine.panel_detector._bg
-            if bg is not None:
-                ok, buf = cv2.imencode(".png", bg)
-                if ok:
-                    bg64 = base64.b64encode(buf.tobytes()).decode()
-            if bg64 is None and self.app.state.project_data:
-                bg64 = self.app.state.project_data.get("background_base64_png")
+            bg = self.engine.panel_detector.get_background_gray()
+
+        # 2) fallback: último bg carregado/capturado
+        if bg is None and self._loaded_bg is not None:
+            bg = self._loaded_bg
+
+        # 3) fallback: reaproveita do projeto atual (se existir)
+        if bg is None and self.app.state.project_data:
+            bg64 = self.app.state.project_data.get("background_base64_png")
+
+        if bg is not None and bg64 is None:
+            ok, buf = cv2.imencode(".png", bg)
+            if ok:
+                bg64 = base64.b64encode(buf.tobytes()).decode()
 
         return {
             "project_name": self._project_name,
@@ -1537,12 +1566,21 @@ class ConfigPage(tk.Frame):
                     self._loaded_bg = bg
             except Exception:
                 self._loaded_bg = None
+        with self._lock:
+            self._shared["has_bg"] = (self._loaded_bg is not None)
 
+        # se o engine estiver rodando, aplica imediatamente
+        if self.engine and self._loaded_bg is not None:
+            self.engine.panel_detector.set_background_gray(self._loaded_bg)
         self.lbl_project.config(text=f"● {self._project_name}", fg=ACCENT)
         self.app.state.project_data = data
         self.app.state.rois = self.rois
 
     def save_project(self):
+        proj = self._project_dict()
+        if not proj.get("background_base64_png"):
+            if not messagebox.askyesno("Sem BG", "Projeto está sem Background. Salvar mesmo assim?"):
+                return
         name = simpledialog.askstring("Projeto", "Nome:", initialvalue=self._project_name)
         if not name:
             return
@@ -2136,8 +2174,7 @@ class ProductionPage(tk.Frame):
             arr = np.frombuffer(base64.b64decode(bg64), np.uint8)
             bg = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
             if bg is not None:
-                pd._bg = bg
-                pd.last_debug["has_bg"] = True
+                pd.set_background_gray(bg)
 
         eng.on_frame          = self._cb_frame
         eng.on_trigger_result = self._cb_trigger

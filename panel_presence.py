@@ -36,6 +36,9 @@ class PanelPresenceDetector:
         self.aoi = aoi  # (x,y,w,h)
         self.params = params or PresenceParams()
 
+
+        self._bg_gray = None
+
         self._bg: Optional[np.ndarray] = None
         self._present: bool = False
         self._on_count: int = 0
@@ -51,18 +54,32 @@ class PanelPresenceDetector:
 
     # ---------- BG getters/setters (para salvar config) ----------
 
-    def get_background_gray(self) -> Optional[np.ndarray]:
-        return None if self._bg is None else self._bg.copy()
-
     def set_background_gray(self, bg_gray: np.ndarray) -> None:
         if bg_gray is None:
             self._bg = None
             self.last_debug["has_bg"] = False
+            # reset states
+            self._present = False
+            self._on_count = 0
+            self._off_count = 0
             return
         if bg_gray.ndim != 2:
             raise ValueError("Background precisa ser grayscale 2D")
         self._bg = bg_gray.copy()
         self.last_debug["has_bg"] = True
+
+        # reset states (opcional, mas recomendado)
+        self._present = False
+        self._on_count = 0
+        self._off_count = 0
+
+    def get_background_gray(self) -> Optional[np.ndarray]:
+        """
+        Retorna o background (grayscale) salvo.
+        - None se não existir BG
+        - retorna cópia defensiva para não ser alterado fora
+        """
+        return None if self._bg is None else self._bg.copy()
 
     # ---------- AOI ----------
 
