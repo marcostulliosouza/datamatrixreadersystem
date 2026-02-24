@@ -634,7 +634,6 @@ class Engine:
         self._thread: Optional[threading.Thread] = None
         self._pool: Optional[ThreadPoolExecutor] = None
 
-        # ✅ FIX: guardar APENAS frames (não tupla com timestamp)
         self._recent: deque = deque(maxlen=6)
         self._recent_lock = threading.Lock()
 
@@ -648,9 +647,11 @@ class Engine:
         self.fps_limit = 12
         self.process_every_n = 1
 
-        # Delay antes do trigger (para evitar borrão/esteira)
+        # Delay antes do trigger (para evitar borrão na esteira)
         self.trigger_delay_ms = 0
         self._present_since = None
+
+        self.mosaic_cols = 3
 
     def start(self, exposure_us: int = 8000) -> bool:
         if self._thread and self._thread.is_alive():
@@ -749,7 +750,7 @@ class Engine:
         fire_ms = (time.time()-t0)*1000
 
         tiles = [self._make_tile(r) for r in results]
-        dbg = self._mosaic(tiles)
+        dbg = self._mosaic(tiles, cols=int(getattr(self, 'mosaic_cols', 3)))
 
         if self.on_trigger_result:
             self.on_trigger_result(results, dbg, passed, fire_ms)
@@ -1462,6 +1463,7 @@ class ConfigPage(tk.Frame):
         eng.process_every_n = int(self.proc_every_n.get())
         eng.rois = self.rois
         eng.decode_params = self._decode_params()
+        eng.mosaic_cols = int(self.mosaic_cols.get())
 
         try:
             self._apply_aoi()
@@ -1580,6 +1582,7 @@ class ConfigPage(tk.Frame):
             "project_name": self._project_name,
             "saved_at": datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
             "version": "3.0",
+            "ui": {"mosaic_cols": int(self.mosaic_cols.get())},
             "camera":     {"exposure_us": int(self.cam_exposure.get())},
             "processing": {"kernel_center": int(self.proc_kernel.get()),
                            "thresh_c": int(self.proc_thresh_c.get())},
@@ -1606,6 +1609,7 @@ class ConfigPage(tk.Frame):
         aoi  = data.get("aoi", {})
         trig = data.get("trigger", {})
         dec  = data.get("decode", {})
+        ui = data.get("ui", {})
 
         self.cam_exposure.set(int(cam.get("exposure_us", 8000)))
         self.proc_kernel.set(int(proc.get("kernel_center", 5)))
@@ -1620,6 +1624,7 @@ class ConfigPage(tk.Frame):
         self.dec_invert.set(bool(dec.get("invert", False)))
         self.dec_t_fast.set(int(dec.get("timeout_fast", 60)))
         self.dec_t_std.set(int(dec.get("timeout_std", 90)))
+        self.mosaic_cols.set(int(ui.get("mosaic_cols", 3)))
 
         self.rois = []
         for r in data.get("rois", []):
@@ -2235,6 +2240,9 @@ class ProductionPage(tk.Frame):
         decoder = DataMatrixDecoder(use_neural=True)
         pd      = PanelPresenceDetector(aoi=(0,0,0,0), params=PresenceParams())
         eng     = Engine(camera, decoder, pd)
+
+        ui = data.get("ui", {})
+        eng.mosaic_cols = int(ui.get("mosaic_cols", 3))
 
         eng.rois = []
         for r in data.get("rois", []):
