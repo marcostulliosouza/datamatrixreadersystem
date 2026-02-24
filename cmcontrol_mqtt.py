@@ -257,8 +257,6 @@ class CmControlMqttClient:
 
         # online
         self._publish("set/state", {"state": "1"})
-        # ❌ REMOVER: login aqui causa race com ensure_login()
-        # self._publish("set/rest/oauth2/login", self.payload_login(bearer=False))
 
     def _on_message(self, client, userdata, msg):
         t = msg.topic
@@ -316,7 +314,7 @@ class CmControlMqttClient:
             else:
                 err = payload.get("log") or payload.get("message") or f"Login falhou. status={status}"
                 self._last_login_error = err
-                self._login_event.set()  # ✅ SEMPRE seta para não virar timeout
+                self._login_event.set()
                 if self.on_login_error:
                     self.on_login_error(err)
             return
@@ -459,89 +457,3 @@ class CmControlMqttClient:
 
     def get_last_apontamento_error(self) -> Optional[str]:
         return self._last_apontamento_error
-
-
-# # ============================================================
-# # EXEMPLO DE USO (DEMO)
-# # ============================================================
-#
-# def gerar_log(serial: str) -> str:
-#     return f"""[ Test Results ]
-# File,
-# 13MRX
-# Test times,
-# 378
-# LotNo. ,
-# 0
-# Barcode,
-# {serial}
-# TIME,
-# {datetime.now().strftime('%Y/%m/%d, %H:%M:%S')}
-# -----  Group  -----
-# All,Group,Component,SHORT Test,OPEN Test ,IC Test,MACRO Test,FUNCTION Test
-# PASS ,
-# 1,PASS,UN-T,UN-T,PASS,UN-T,UN-T
-# PASS ,
-# 2,PASS,UN-T,UN-T,PASS,UN-T,UN-T
-# PASS ,
-# 3,PASS,UN-T,UN-T,PASS,UN-T,UN-T
-# PASS ,
-# 4,PASS,UN-T,UN-T,PASS,UN-T,UN-T
-# PASS ,
-# 5,PASS,UN-T,UN-T,PASS,UN-T,UN-T
-# PASS ,
-# 6,PASS,UN-T,UN-T,FAIL,UN-T,UN-T
-# """
-
-
-# def main_demo():
-#     cfg = load_config_from_env()
-#     quantidade = env_int("CMC_DEMO_QTD", 1)
-#
-#     def _login_ok():
-#         print("🔐 Login realizado com sucesso")
-#
-#     def _login_err(err: str):
-#         print("❌ Erro login:", err)
-#
-#     def _ap_ok():
-#         print("✅ Apontamento OK")
-#
-#     def _ap_err(err: str):
-#         print("❌ Erro apontamento:", err)
-#
-#     with CmControlMqttClient(cfg) as cmc:
-#         cmc.on_login_ok = _login_ok
-#         cmc.on_login_error = _login_err
-#         cmc.on_apontamento_ok = _ap_ok
-#         cmc.on_apontamento_error = _ap_err
-#
-#         # garante login antes de começar
-#         cmc.ensure_login(timeout_s=10)
-#
-#         print(f"Iniciando demo com {quantidade} apontamentos...")
-#         while(True):
-#             serial = f"APT_{now_ts()}"
-#             print(f"\n[{quantidade}] Validando rota: {serial}")
-#             cmc.validar_rota(serial)
-#             time.sleep(2)
-#
-#             err = cmc.get_last_apontamento_error()
-#             if err:
-#                 print("Falhou na validação de rota:", err)
-#                 continue
-#
-#             # log_txt = gerar_log(serial)
-#             # evidencias = [{
-#             #     "nome": "log_teste",
-#             #     "extensao": "txt",
-#             #     "conteudo": b64(log_txt),
-#             # }]
-#
-#             print(f"[{i+1}/{quantidade}] Apontando serial: {serial}")
-#             cmc.apontar(serial)
-#             time.sleep(2)
-#
-#
-# if __name__ == "__main__":
-#     main_demo()

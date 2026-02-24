@@ -212,6 +212,15 @@ def _scrollable(parent, bg=BG_DEEP):
 
     return inner
 
+def _env_has_api_creds() -> bool:
+    try:
+        base_cfg = cmcontrol_mqtt.load_config_from_env()
+        u = (getattr(base_cfg, "api_user", None) or "").strip()
+        p = (getattr(base_cfg, "api_pass", None) or "").strip()
+        return bool(u and p)
+    except Exception:
+        return False
+
 
 # ══════════════════════════════════════════════════════════════════
 #  ROI DATACLASS
@@ -280,6 +289,7 @@ class AppState:
         self.last_codes:     List[Dict] = []
         self.last_debug_img: Optional[np.ndarray] = None
 
+        self.skip_auto_login_once = False
 
 # ══════════════════════════════════════════════════════════════════
 #  ROUTER
@@ -311,6 +321,12 @@ class App(tk.Tk):
 
         self.show("LoginPage")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def on_show(self):
+        pass
+
+    def on_hide(self):
+        pass
 
     def show(self, name: str):
         # chama on_hide da tela atual
@@ -373,8 +389,8 @@ class LoginPage(tk.Frame):
 
         self.var_user = tk.StringVar()
         self.var_pass = tk.StringVar()
-        self._field(inner, "USUÁRIO", self.var_user, False)
-        self._field(inner, "SENHA",   self.var_pass, True)
+        e_user = self._field(inner, "USUÁRIO", self.var_user, False)
+        e_pass = self._field(inner, "SENHA",   self.var_pass, True)
 
         self.lbl_err = tk.Label(inner, text="", bg=BG_PANEL, fg=RED, font=FONT_LBL)
         self.lbl_err.pack(anchor="w", pady=(6, 0))
@@ -384,8 +400,9 @@ class LoginPage(tk.Frame):
 
         tk.Label(inner, text="v3.0 · Acesso Restrito",
                  bg=BG_PANEL, fg=TEXT_DIM, font=FONT_LBL).pack(pady=(22, 0))
-
-        self.bind_all("<Return>", lambda e: self.do_login())
+        e_user.bind("<Return>", lambda e: self.do_login())
+        e_pass.bind("<Return>", lambda e: self.do_login())
+        # self.bind_all("<Return>", lambda e: self.do_login())
 
     def _field(self, parent, label, var, password):
         tk.Label(parent, text=label, bg=BG_PANEL, fg=TEXT_DIM,
@@ -396,6 +413,7 @@ class LoginPage(tk.Frame):
                      highlightthickness=1, highlightcolor=ACCENT,
                      highlightbackground=BORDER)
         e.pack(fill="x", pady=(0, 14), ipady=6)
+        return e
 
     def _draw_bg(self, e=None):
         c = self._bg_canvas
@@ -407,17 +425,8 @@ class LoginPage(tk.Frame):
         c.create_oval(w-200, h-200, w+120, h+120, outline="#1a2035", width=1)
         c.create_oval(w-300, h-300, w+220, h+220, outline="#131825", width=1)
 
-    def do_login(self):
-        u = self.var_user.get().strip()
-        p = self.var_pass.get()
-
-        if not u or not p:
-            self.lbl_err.config(text="⚠  Preencha usuário e senha.")
-            return
-
-        self.lbl_err.config(text="Validando credenciais no CMControl...")
-        self.update_idletasks()
-
+    def _try_login(self, u: str, p: str) -> bool:
+        """Tenta logar no CMControl e, se OK, salva no state e retorna True."""
         try:
             base_cfg = cmcontrol_mqtt.load_config_from_env()
 
@@ -450,14 +459,51 @@ class LoginPage(tk.Frame):
             self.app.state.user = {"username": u, "password": p}
             self.app.state.cmc = cmc
             self.app.state.cmc_ready = True
-
-            self.lbl_err.config(text="")
-            self.app.show("MenuPage")
+            return True
 
         except Exception as e:
             self.lbl_err.config(text=f"❌ Login inválido: {str(e)[:120]}")
+            return False
+
+    def do_login(self):
+        u = self.var_user.get().strip()
+        p = self.var_pass.get()
+
+        if not u or not p:
+            self.lbl_err.config(text="⚠  Preencha usuário e senha.")
             return
 
+        self.lbl_err.config(text="Validando credenciais no CMControl...")
+        self.update_idletasks()
+
+        if self._try_login(u, p):
+            self.lbl_err.config(text="")
+            self.app.show("MenuPage")
+
+    def on_show(self):
+        # ✅ se alguém pediu pra abrir login sem auto-login (ex: logout)
+        if getattr(self.app.state, "skip_auto_login_once", False):
+            self.app.state.skip_auto_login_once = False
+            self.lbl_err.config(text="")
+            return
+
+        # auto-login normal se env tiver credenciais
+        try:
+            base_cfg = cmcontrol_mqtt.load_config_from_env()
+            u = (getattr(base_cfg, "api_user", None) or "").strip()
+            p = (getattr(base_cfg, "api_pass", None) or "").strip()
+        except Exception:
+            u, p = "", ""
+
+        if u and p:
+            self.lbl_err.config(text="Auto-login (env) no CMControl...")
+            self.update_idletasks()
+            self.var_user.set(u)
+            self.var_pass.set(p)
+
+            if self._try_login(u, p):
+                self.lbl_err.config(text="")
+                self.app.show("MenuPage")
 
 # ══════════════════════════════════════════════════════════════════
 #  MENU
@@ -542,16 +588,27 @@ class MenuPage(tk.Frame):
             self.lbl_user.config(text=f"●  {u['username']}")
 
     def logout(self):
+        # sempre desconecta primeiro
         cmc = self.app.state.cmc
         if cmc:
             try:
                 cmc.disconnect()
             except Exception:
                 pass
+
         self.app.state.cmc = None
         self.app.state.cmc_ready = False
         self.app.state.user = None
-        self.app.show("LoginPage")
+
+        # ✅ regra pedida:
+        # - se tiver credencial no env => SAIR do programa
+        # - se não tiver => voltar para login
+        if _env_has_api_creds():
+            self.app._on_close()  # fecha o app inteiro
+        else:
+            # garante que não vai auto-logar por engano
+            self.app.state.skip_auto_login_once = True
+            self.app.show("LoginPage")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -882,6 +939,9 @@ class ConfigPage(tk.Frame):
         self.engine: Optional[Engine] = None
         self._loaded_bg = None
 
+        self._last_exposure_us = None
+        self._last_exposure_apply_t = 0.0
+
         self.trigger_delay_ms = tk.IntVar(value=150)
 
         self._active = False
@@ -926,11 +986,11 @@ class ConfigPage(tk.Frame):
         # AOI selection
         self._aoi_active = False
         self._aoi_start  = None
-        self._aoi_curr   = None  # ✅ preview “ao vivo” (fix desenho durante arrasto)
+        self._aoi_curr   = None
 
         # ROI draw
         self._roi_draw_start = None
-        self._roi_draw_rect  = None
+        self._roi_draw_curr  = None
 
         # ROI edit
         self._roi_action = None
@@ -1384,6 +1444,18 @@ class ConfigPage(tk.Frame):
         eng = self.engine
         if not eng:
             return
+        try:
+            exp = int(self.cam_exposure.get())
+            now = time.time()
+            if (self._last_exposure_us != exp) and (now - self._last_exposure_apply_t > 0.25):
+                # algumas câmeras aceitam set_exposure durante grabbing
+                eng.camera.set_exposure(exp)
+                self._last_exposure_us = exp
+                self._last_exposure_apply_t = now
+        except Exception:
+            # se a câmera/SDK não permitir ao vivo, vai falhar aqui
+            print("Erro câmera/SDK não permitir ao vivo!")
+            pass
 
         eng.trigger_delay_ms = int(self.trigger_delay_ms.get())
         eng.fps_limit = int(self.fps_limit.get())
@@ -1612,6 +1684,8 @@ class ConfigPage(tk.Frame):
         messagebox.showinfo("Carregado", f"✅ {self._project_name} carregado.")
 
     # ── ROI helpers ──────────────────────────────────────────────
+
+
     def _next_roi_id(self):
         return max([r.id for r in self.rois], default=0) + 1
 
@@ -1681,8 +1755,7 @@ class ConfigPage(tk.Frame):
             if which == "original" and self.roi_edit_mode.get():
                 if self.roi_draw_mode.get() and not ctrl and not shift and not alt:
                     self._roi_draw_start = (e.x, e.y)
-                    self._roi_draw_rect = canvas.create_rectangle(
-                        e.x, e.y, e.x, e.y, outline=ACCENT, width=2, dash=(6,3))
+                    self._roi_draw_curr = (e.x, e.y)
                     return "break"
                 for r in self.rois:
                     if r.contains_point(ix, iy):
@@ -1708,8 +1781,8 @@ class ConfigPage(tk.Frame):
 
         def _motion(e):
             if which == "original" and self.roi_draw_mode.get() and self._roi_draw_start:
-                x0, y0 = self._roi_draw_start
-                canvas.coords(self._roi_draw_rect, x0, y0, e.x, e.y)
+                # x0, y0 = self._roi_draw_start
+                self._roi_draw_curr = (e.x, e.y)
                 return "break"
 
             if self._roi_action and self.selected_roi_id is not None:
@@ -1730,7 +1803,6 @@ class ConfigPage(tk.Frame):
                     self._select_roi(roi.id)
                 return "break"
 
-            # ✅ FIX: AOI preview (salva posição atual; desenho acontece no frame)
             if which == "original" and self._aoi_active and self._aoi_start:
                 self._aoi_curr = (e.x, e.y)
                 return "break"
@@ -1746,15 +1818,21 @@ class ConfigPage(tk.Frame):
 
             if which == "original" and self.roi_draw_mode.get() and self._roi_draw_start:
                 x0c, y0c = self._roi_draw_start
+                x1c, y1c = e.x, e.y
+
                 ix0, iy0 = self._canvas_to_img(which, x0c, y0c)
-                w = abs(ix - ix0); h = abs(iy - iy0)
+                ix1, iy1 = self._canvas_to_img(which, x1c, y1c)
+
+                w = abs(ix1 - ix0);
+                h = abs(iy1 - iy0)
                 if w >= 10 and h >= 10:
                     rid = self._next_roi_id()
-                    self.rois.append(ROI(id=rid, cx=(ix0+ix)/2, cy=(iy0+iy)/2,
-                                        w=w, h=h, angle=0.0))
+                    self.rois.append(ROI(id=rid, cx=(ix0 + ix1) / 2, cy=(iy0 + iy1) / 2,
+                                         w=w, h=h, angle=0.0))
                     self._select_roi(rid)
-                canvas.delete(self._roi_draw_rect)
-                self._roi_draw_start = None; self._roi_draw_rect = None
+
+                self._roi_draw_start = None
+                self._roi_draw_curr = None
                 return "break"
 
             if self._roi_action:
@@ -1858,7 +1936,25 @@ class ConfigPage(tk.Frame):
 
                 # ✅ agora draw nunca será None aqui
                 orig = cv2.cvtColor(draw, cv2.COLOR_GRAY2BGR) if draw.ndim == 2 else draw.copy()
+            if self.roi_draw_mode.get() and self._roi_draw_start and self._roi_draw_curr:
+                x0c, y0c = self._roi_draw_start
+                x1c, y1c = self._roi_draw_curr
+                ix0, iy0 = self._canvas_to_img("original", x0c, y0c)
+                ix1, iy1 = self._canvas_to_img("original", x1c, y1c)
+                x0, y0 = int(min(ix0, ix1)), int(min(iy0, iy1))
+                x1, y1 = int(max(ix0, ix1)), int(max(iy0, iy1))
 
+                # retângulo "tracejado" simples (segmentado) — opcional
+                step = 14
+                for x in range(x0, x1, step):
+                    cv2.line(orig, (x, y0), (min(x + step // 2, x1), y0), (0, 255, 0), 3)
+                    cv2.line(orig, (x, y1), (min(x + step // 2, x1), y1), (0, 255, 0), 3)
+                for y in range(y0, y1, step):
+                    cv2.line(orig, (x0, y), (x0, min(y + step // 2, y1)), (0, 255, 0), 3)
+                    cv2.line(orig, (x1, y), (x1, min(y + step // 2, y1)), (0, 255, 0), 3)
+
+                cv2.putText(orig, "Desenhando ROI...", (x0 + 8, max(30, y0 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
             # AOI overlay (fixa)
             ax, ay, aw, ah = (int(self.aoi_x.get()), int(self.aoi_y.get()),
                               int(self.aoi_w.get()), int(self.aoi_h.get()))
