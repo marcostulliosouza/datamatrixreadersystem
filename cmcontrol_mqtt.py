@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 import os
 import uuid
+import re
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -127,6 +128,91 @@ class CmControlMqttClient:
     # -------------------------
     # Helpers
     # -------------------------
+    # @staticmethod
+    # def _apontamento_ok(payload: Dict[str, Any]) -> (bool, str):
+    #     """
+    #     Regra de negócio:
+    #     - status 200 sozinho NÃO garante sucesso.
+    #     - Se houver log/message com cara de erro -> FAIL.
+    #     Retorna (ok, err_msg).
+    #     """
+    #     status = payload.get("status")
+    #
+    #     # status pode vir "200 OK ..." também
+    #     code = None
+    #     if isinstance(status, int):
+    #         code = status
+    #     elif isinstance(status, str):
+    #         m = re.match(r"^\s*(\d{3})\b", status.strip())
+    #         if m:
+    #             code = int(m.group(1))
+    #
+    #     log = str(payload.get("log") or payload.get("message") or "").strip()
+    #
+    #     # Se não for 200, é falha
+    #     if code != 200:
+    #         return False, (log or f"Status={status}")
+    #
+    #     # 200 com log vazio -> OK
+    #     if not log:
+    #         return True, ""
+    #
+    #     # 200 com log: decide por palavras-chave
+    #     up = log.upper()
+    #
+    #     # ajuste aqui conforme sua realidade
+    #     fail_keywords = [
+    #         "ERRO", "FALHA", "NOK", "INVÁL", "INVALID", "NÃO", "NAO",
+    #         "TIMEOUT", "DUPLIC", "JÁ", "JA", "BLOQUE", "SEM PERMIS", "NÃO PERMIT", "NAO PERMIT"
+    #     ]
+    #     if any(k in up for k in fail_keywords):
+    #         return False, log
+    #
+    #     # se o log é “informativo” mas sem erro, mantém OK
+    #     return True, ""
+
+    @staticmethod
+    def apontamento_result(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Retorna:
+          { ok: bool, code: int|None, reason: str, detail: str }
+        Regras:
+          - status 200 + log vazio => OK
+          - status 200 + "ERROxx:" => FAIL (exceto ERRO4 se quiser tratar como OK)
+          - status != 200 => FAIL
+        """
+        status = payload.get("status")
+        log = str(payload.get("log") or payload.get("message") or "").strip()
+
+        # code numérico
+        code = None
+        if isinstance(status, int):
+            code = status
+        else:
+            s = str(status or "").strip()
+            m = re.match(r"^(\d{3})\b", s)
+            if m:
+                code = int(m.group(1))
+
+        if code != 200:
+            return {"ok": False, "code": code, "reason": f"{status}", "detail": log}
+
+        # ✅ 200 com log vazio = sucesso
+        if not log:
+            return {"ok": True, "code": 200, "reason": "OK", "detail": ""}
+
+        up = log.upper()
+
+        # ✅ opcional: ERRO4 = já apontado => tratar como sucesso
+        if up.startswith("ERRO4"):
+            return {"ok": True, "code": 200, "reason": "JÁ APONTADO (ERRO4)", "detail": log}
+
+        # FAIL por erro de negócio
+        if up.startswith("ERRO") or "FALHA" in up or "NOK" in up:
+            return {"ok": False, "code": 200, "reason": up.split(":")[0], "detail": log}
+
+        # se veio msg mas não parece erro => ok
+        return {"ok": True, "code": 200, "reason": "OK", "detail": log}
 
     def topic(self, path: str) -> str:
         return f"br/com/cmcontrol/dispositivo/{self.cfg.device_addr}/{path}"
@@ -324,27 +410,23 @@ class CmControlMqttClient:
             self._last_apontamento_payload = payload
             self._ap_event.set()
 
-            # callback "raw" (se quiser ver o payload completo no GUI)
             if self.on_apontamento_response:
                 try:
                     self.on_apontamento_response(payload)
                 except Exception:
                     pass
 
-            status = payload.get("status")
-            ok = (status == 200) or (status == "200")
+            r = self.apontamento_result(payload)
 
-            if not ok:
-                err = payload.get("log", "Erro desconhecido no apontamento")
-                self._last_apontamento_error = err
+            if not r["ok"]:
+                self._last_apontamento_error = r["detail"] or r["reason"] or "Erro desconhecido no apontamento"
                 if self.on_apontamento_error:
-                    self.on_apontamento_error(err)
+                    self.on_apontamento_error(self._last_apontamento_error)
             else:
                 self._last_apontamento_error = None
                 if self.on_apontamento_ok:
                     self.on_apontamento_ok()
             return
-
         # logout response
         if t.endswith("/get/rest/oauth2/logout"):
             # opcional: logar payload

@@ -14,13 +14,11 @@ Estrutura:
 
 from __future__ import annotations
 
-import json, base64, threading, time, math, os
+import base64, threading, time, math, os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict, Any, List
-from queue import Empty
 
 import cv2
 import numpy as np
@@ -92,18 +90,56 @@ def _btn(parent, text, command=None, style="ghost", padx=14, pady=7, width=None)
         "violet" : (ACCENT2,   "#fff",    "#5b21b6"),
         "ghost"  : (BORDER_LT, TEXT_SEC,  BG_HOVER),
         "subtle" : (BG_CARD,   TEXT_SEC,  BG_HOVER),
+        "disabled": (MUTED,    TEXT_DIM,  MUTED),
     }
+
     bg, fg, hbg = pal.get(style, pal["ghost"])
+
     kw = dict(text=text, bg=bg, fg=fg, font=FONT_BOLD,
               padx=padx, pady=pady, cursor="hand2", relief="flat",
               activebackground=hbg, activeforeground=fg)
     if width:
         kw["width"] = width
+
     b = tk.Label(parent, **kw)
-    b.bind("<Enter>", lambda e: b.config(bg=hbg))
-    b.bind("<Leave>", lambda e: b.config(bg=bg))
-    if command:
-        b.bind("<Button-1>", lambda e: command())
+
+    # guarda estado
+    b._base_bg = bg
+    b._hover_bg = hbg
+    b._base_fg = fg
+    b._enabled = True
+    b._command = command
+
+    def _enter(_):
+        if b._enabled:
+            b.config(bg=b._hover_bg)
+    def _leave(_):
+        b.config(bg=b._base_bg)
+    def _click(_):
+        if b._enabled and b._command:
+            b._command()
+
+    b.bind("<Enter>", _enter)
+    b.bind("<Leave>", _leave)
+    b.bind("<Button-1>", _click)
+
+    def set_style(new_style: str):
+        bg2, fg2, hbg2 = pal.get(new_style, pal["ghost"])
+        b._base_bg = bg2
+        b._hover_bg = hbg2
+        b._base_fg = fg2
+        b.config(bg=bg2, fg=fg2)
+
+    def set_enabled(enabled: bool):
+        b._enabled = bool(enabled)
+        if b._enabled:
+            b.config(cursor="hand2")
+        else:
+            b.config(cursor="arrow")
+
+    b.set_style = set_style
+    b.set_enabled = set_enabled
+
     return b
 
 
@@ -206,9 +242,17 @@ def _scrollable(parent, bg=BG_DEEP):
     def _wheel(e):
         if e.delta:
             cv.yview_scroll(int(-e.delta / 120), "units")
-    cv.bind_all("<MouseWheel>", _wheel)
-    cv.bind_all("<Button-4>",   lambda e: cv.yview_scroll(-1, "units"))
-    cv.bind_all("<Button-5>",   lambda e: cv.yview_scroll(1,  "units"))
+
+    def _wheel_linux_up(e):
+        cv.yview_scroll(-1, "units")
+
+    def _wheel_linux_down(e):
+        cv.yview_scroll(1, "units")
+
+    for w in (cv, inner):
+        w.bind("<MouseWheel>", _wheel)
+        w.bind("<Button-4>", _wheel_linux_up)
+        w.bind("<Button-5>", _wheel_linux_down)
 
     return inner
 
@@ -604,9 +648,9 @@ class MenuPage(tk.Frame):
         # - se tiver credencial no env => SAIR do programa
         # - se não tiver => voltar para login
         if _env_has_api_creds():
-            self.app._on_close()  # fecha o app inteiro
+            if messagebox.askyesno("Sair", "Deseja sair do programa?"):
+                self.app._on_close() #Type: ignore
         else:
-            # garante que não vai auto-logar por engano
             self.app.state.skip_auto_login_once = True
             self.app.show("LoginPage")
 
@@ -653,6 +697,8 @@ class Engine:
 
         self.mosaic_cols = 3
 
+        self._pool_workers = 0
+
     def start(self, exposure_us: int = 8000) -> bool:
         if self._thread and self._thread.is_alive():
             return True
@@ -686,9 +732,16 @@ class Engine:
             self.on_state_change(self.state)
 
     def _ensure_pool(self):
-        n = max(1, min(len(self.rois), os.cpu_count() or 4))
-        if self._pool is None:
-            self._pool = ThreadPoolExecutor(max_workers=n)
+        desired = max(1, min(len(self.rois) if self.rois else 1, os.cpu_count() or 4))
+        if self._pool is None or desired != self._pool_workers:
+            # recria pool se mudou
+            if self._pool:
+                try:
+                    self._pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+            self._pool = ThreadPoolExecutor(max_workers=desired)
+            self._pool_workers = desired
 
     @staticmethod
     def _sharpness(gray):
@@ -1027,6 +1080,8 @@ class ConfigPage(tk.Frame):
         self._hist = []  # lista de (ts, tag, msg)
         self._hist_max = 200
 
+        self._last_exp_warn_t = 0.0
+
     def _hist_add(self, tag: str, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
         self._hist.append((ts, tag, msg))
@@ -1061,8 +1116,10 @@ class ConfigPage(tk.Frame):
             pass
 
         self.engine = None
-        self.btn_start.config(bg=GREEN)
-        self.btn_stop.config(bg=BORDER_LT)
+        self.btn_start.set_style("success") # Type: ignore
+        self.btn_start.set_enabled(True) # Type: ignore
+        self.btn_stop.set_style("disabled") # Type: ignore
+        self.btn_stop.set_enabled(False) # Type: ignore
 
     # ── SHOW ────────────────────────────────────────────────────
     def on_show(self):
@@ -1145,6 +1202,9 @@ class ConfigPage(tk.Frame):
                               style="danger",  padx=14, pady=6)
         self.btn_start.pack(side="left", padx=8, pady=6)
         self.btn_stop.pack(side="left", padx=4, pady=6)
+
+        self.btn_stop.set_style("disabled") # Type: ignore
+        self.btn_stop.set_enabled(False) #Type: ignore
 
         for text, var in [("❄ Congelar", self.freeze),
                           ("Overlay", self.show_overlay)]:
@@ -1405,8 +1465,10 @@ class ConfigPage(tk.Frame):
             self.engine = None
             return
 
-        self.btn_start.config(bg=TEXT_DIM)
-        self.btn_stop.config(bg=RED)
+        self.btn_start.set_style("disabled") # type: ignore
+        self.btn_start.set_enabled(False) # type: ignore
+        self.btn_stop.set_style("danger") # type: ignore
+        self.btn_stop.set_enabled(True)# type: ignore
 
     def rearm(self):
         if self.engine:
@@ -1454,9 +1516,11 @@ class ConfigPage(tk.Frame):
                 self._last_exposure_us = exp
                 self._last_exposure_apply_t = now
         except Exception:
-            # se a câmera/SDK não permitir ao vivo, vai falhar aqui
-            print("Erro câmera/SDK não permitir ao vivo!")
-            pass
+            now = time.time()
+            if now - self._last_exp_warn_t > 2.0:
+                self._last_exp_warn_t = now
+                self._hist_add("CAM", "SDK não permite set_exposure ao vivo.")
+                self.after(0, self._hist_refresh_text)
 
         eng.trigger_delay_ms = int(self.trigger_delay_ms.get())
         eng.fps_limit = int(self.fps_limit.get())
@@ -1482,8 +1546,29 @@ class ConfigPage(tk.Frame):
             else:
                 self._shared["fail_count"] += 1
 
+        roi_stat = {}
+        for r in codes:
+            rid = int(r.get("roi_id", 0))
+            txt = r.get("text")
+            roi_stat[rid] = {"text": txt, "decode_ok": bool(txt), "cmc_ok": None, "cmc_reason": ""}
+
+        with self._lock:
+            self._shared["roi_stat"] = roi_stat
+
         decoded = [r.get("text") for r in codes if r.get("text")]
         decoded = list(dict.fromkeys(decoded))  # evita duplicados mantendo ordem
+
+        passed_decode = bool(passed)
+
+        cmc = self.app.state.cmc
+        needs_cmc = bool(self._active and self.cmc_enabled.get() and decoded and cmc)
+
+        with self._lock:
+            # se vai apontar, o resultado final ainda não está pronto
+            if needs_cmc:
+                self._shared["passed"] = None  # mostra "aguardando CMC"
+            else:
+                self._shared["passed"] = passed_decode
 
         self._hist_add("TRG", f"{'PASS' if passed else 'FAIL'} | codes={len(decoded)} | {dec_ms:.0f}ms")
         self.after(0, self._hist_refresh_text)
@@ -1514,29 +1599,34 @@ class ConfigPage(tk.Frame):
                     return
 
                 seriais = payload_local if isinstance(payload_local, list) else [payload_local]
-
+                all_ok = True
                 for serial in seriais:
                     if (not self._active) or (self._run_id != run_id):
                         return
 
-                    # se seu CmControlMqttClient não for thread-safe, use um lock:
-                    # with self._cmc_lock:
                     resp = cmc.apontar(serial, timeout_s=15)
 
-                    status = (resp or {}).get("status", "SEM_STATUS")
-                    log = (resp or {}).get("log", "")
-
-                    if status == "OK":
-                        self.after(0, lambda s=serial: self._hist_add("CMC", f"✅ OK | serial={s}"))
+                    r = cmc.apontamento_result(resp)
+                    if not r["ok"]:
+                        all_ok = False
+                    if r["ok"]:
+                        self.after(0, lambda s=serial, rr=r["reason"]:
+                        self._hist_add("CMC", f"✅ {rr} | serial={s}"))
                     else:
-                        self.after(
-                            0,
-                            lambda s=serial, st=status, lg=log:
-                            self._hist_add("CMC", f"❌ {st}: {lg} | serial={s}")
-                        )
+                        self.after(0, lambda s=serial, rr=r["reason"], dd=r["detail"]:
+                        self._hist_add("CMC", f"❌ {rr}: {dd} | serial={s}"))
 
                     # opcional: delay pra não saturar broker/API
-                    # time.sleep(0.05)
+                    time.sleep(0.05)
+
+                final_passed = bool(passed_decode and all_ok)
+
+                def _set_final():
+                    with self._lock:
+                        self._shared["passed"] = final_passed
+                        self._shared["cmc_all_ok"] = all_ok
+                    self._hist_refresh_text()
+                self.after(0, _set_final)
 
             except Exception as e:
                 msg = str(e)[:180]
@@ -1930,17 +2020,16 @@ class ConfigPage(tk.Frame):
 
         # draw original
         if frame is not None:
-            if frame is not None:
-                if self.freeze.get():
-                    if self._frozen_frame is None:
-                        self._frozen_frame = frame.copy()
-                    draw = self._frozen_frame
-                else:
-                    draw = frame
-                    self._frozen_frame = None
+            if self.freeze.get():
+                if self._frozen_frame is None:
+                    self._frozen_frame = frame.copy()
+                draw = self._frozen_frame
+            else:
+                draw = frame
+                self._frozen_frame = None
 
-                # ✅ agora draw nunca será None aqui
-                orig = cv2.cvtColor(draw, cv2.COLOR_GRAY2BGR) if draw.ndim == 2 else draw.copy()
+            # ✅ agora draw nunca será None aqui
+            orig = cv2.cvtColor(draw, cv2.COLOR_GRAY2BGR) if draw.ndim == 2 else draw.copy()
             if self.roi_draw_mode.get() and self._roi_draw_start and self._roi_draw_curr:
                 x0c, y0c = self._roi_draw_start
                 x1c, y1c = self._roi_draw_curr
@@ -2106,6 +2195,7 @@ class ProductionPage(tk.Frame):
 
         vid_h = tk.Frame(vid, bg=BG_PANEL)
         vid_h.pack(fill="x")
+
         self._cam_dot = tk.Label(vid_h, text="●", bg=BG_PANEL, fg=MUTED,
                                  font=("Segoe UI",10))
         self._cam_dot.pack(side="left", padx=(10,4), pady=6)
@@ -2113,29 +2203,33 @@ class ProductionPage(tk.Frame):
                  font=FONT_BOLD).pack(side="left")
         self.lbl_fps = tk.Label(vid_h, text="", bg=BG_PANEL,
                                 fg=ACCENT, font=FONT_MONO)
+        self.lbl_dec = tk.Label(vid_h, text="Decode: – ms",
+                                bg=BG_PANEL, fg=YELLOW, font=FONT_MONO)
+        self.lbl_dec.pack(side="right", padx=12)
+
         self.lbl_fps.pack(side="right", padx=12)
 
         self.canvas_live = tk.Canvas(vid, bg="#090b0f", highlightthickness=0)
         self.canvas_live.pack(fill="both", expand=True, padx=4, pady=4)
 
-        dbg_wrap = tk.Frame(vid, bg=BG_CARD,
-                            highlightbackground=BORDER, highlightthickness=1)
-        dbg_wrap.pack(fill="x", padx=0, pady=(4, 0))
-
-        dbg_h2 = tk.Frame(dbg_wrap, bg=BG_PANEL)
-        dbg_h2.pack(fill="x")
-
-        tk.Label(dbg_h2, text="DEBUG  ·  último trigger",
-                 bg=BG_PANEL, fg=TEXT_DIM, font=FONT_BOLD
-        ).pack(side="left", padx=10, pady=5)
-
-        self.lbl_dec = tk.Label(dbg_h2, text="Decode: –",
-                                bg=BG_PANEL, fg=YELLOW, font=FONT_MONO)
-        self.lbl_dec.pack(side="right", padx=10)
-
-        self.canvas_debug = tk.Canvas(dbg_wrap, bg="#090b0f",
-                                      highlightthickness=0, height=220)
-        self.canvas_debug.pack(fill="x", padx=4, pady=4)
+        # dbg_wrap = tk.Frame(vid, bg=BG_CARD,
+        #                     highlightbackground=BORDER, highlightthickness=1)
+        # dbg_wrap.pack(fill="x", padx=0, pady=(4, 0))
+        #
+        # dbg_h2 = tk.Frame(dbg_wrap, bg=BG_PANEL)
+        # dbg_h2.pack(fill="x")
+        #
+        # tk.Label(dbg_h2, text="DEBUG  ·  último trigger",
+        #          bg=BG_PANEL, fg=TEXT_DIM, font=FONT_BOLD
+        # ).pack(side="left", padx=10, pady=5)
+        #
+        # self.lbl_dec = tk.Label(dbg_h2, text="Decode: –",
+        #                         bg=BG_PANEL, fg=YELLOW, font=FONT_MONO)
+        # self.lbl_dec.pack(side="right", padx=10)
+        #
+        # self.canvas_debug = tk.Canvas(dbg_wrap, bg="#090b0f",
+        #                               highlightthickness=0, height=220)
+        # self.canvas_debug.pack(fill="x", padx=4, pady=4)
 
         right = tk.Frame(body, bg=BG_DEEP, width=360)
         right.pack(side="right", fill="y")
@@ -2148,6 +2242,7 @@ class ProductionPage(tk.Frame):
         self._status_bar.pack(fill="x")
         status_i = tk.Frame(status_c, bg=BG_CARD, padx=14, pady=12)
         status_i.pack(fill="x")
+
         self.lbl_result = tk.Label(status_i, text="AGUARDANDO",
                                    bg=BG_CARD, fg=MUTED,
                                    font=("Segoe UI", 24, "bold"))
@@ -2158,6 +2253,11 @@ class ProductionPage(tk.Frame):
         self.lbl_occ = tk.Label(status_c, text="Occ: –%  BG: –",
                                 bg=BG_CARD, fg=TEXT_SEC, font=FONT_LBL)
         self.lbl_occ.pack(anchor="w", padx=14, pady=(0,8))
+
+        cmc_body = _section(right, "CMControl MQTT")
+        r = _row(cmc_body)
+        _chk(r, "Habilitado", self.cmc_enabled, bg=BG_CARD).pack(side="left")
+        _chk(r, "Batch mode", self.cmc_batch, bg=BG_CARD).pack(side="left", padx=12)
 
         cnt = tk.Frame(right, bg=BG_DEEP)
         cnt.pack(fill="x", padx=6, pady=(0,6))
@@ -2181,14 +2281,22 @@ class ProductionPage(tk.Frame):
             self._cnt_widgets[key] = v
 
         tbl_body = _section(right, "LEITURAS — último trigger")
-        cols = ("ROI", "Código", "ms")
+        cols = ("ROI", "Código", "Decode", "Apont.", "Motivo", "ms")
         self.tree = ttk.Treeview(tbl_body, columns=cols, show="headings", height=8)
-        self.tree.heading("ROI",    text="ROI")
+
+        self.tree.heading("ROI", text="ROI")
         self.tree.heading("Código", text="Código")
-        self.tree.heading("ms",     text="ms")
-        self.tree.column("ROI",    width=40, anchor="center")
-        self.tree.column("Código", width=220, anchor="w")
-        self.tree.column("ms",     width=60,  anchor="center")
+        self.tree.heading("Decode", text="Decode")
+        self.tree.heading("Apont.", text="Apont.")
+        self.tree.heading("Motivo", text="Motivo")
+        self.tree.heading("ms", text="ms")
+
+        self.tree.column("ROI", width=20, anchor="center")
+        self.tree.column("Código", width=80, anchor="w")
+        self.tree.column("Decode", width=70, anchor="center")
+        self.tree.column("Apont.", width=70, anchor="center")
+        self.tree.column("Motivo", width=80, anchor="w")
+        self.tree.column("ms", width=55, anchor="center")
         scr = ttk.Scrollbar(tbl_body, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scr.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -2315,21 +2423,56 @@ class ProductionPage(tk.Frame):
             self._shared["fps"] = fps
 
     def _cb_trigger(self, codes, dbg_img, passed, dec_ms):
+        # ---- prepara dados base ----
+        decoded = [r.get("text") for r in codes if r.get("text")]
+        decoded = list(dict.fromkeys(decoded))  # sem duplicados
+        passed_decode = bool(passed)
+
+        cmc = self.app.state.cmc
+        needs_cmc = bool(self._active and self.cmc_enabled.get() and decoded and cmc)
+
         with self._lock:
             self._shared["codes"] = codes
             self._shared["debug_img"] = dbg_img
-            self._shared["passed"] = passed
             self._shared["dec_ms"] = dec_ms
+
+            # TOTAL sempre conta trigger
             self._shared["total"] += 1
-            if passed:
-                self._shared["ok_count"] += 1
+
+            # ✅ contadores OK/FAIL só fecham quando resultado final está definido
+            if needs_cmc:
+                self._shared["passed"] = None  # apontando...
             else:
-                self._shared["fail_count"] += 1
+                self._shared["passed"] = passed_decode
+                if passed_decode:
+                    self._shared["ok_count"] += 1
+                else:
+                    self._shared["fail_count"] += 1
 
-        decoded = [r.get("text") for r in codes if r.get("text")]
-        decoded = list(dict.fromkeys(decoded))  # evita duplicados mantendo ordem
+        # ---- status por ROI ----
+        roi_stat = {}
+        for r in codes:
+            rid = int(r.get("roi_id", 0))
+            txt = r.get("text")
+            roi_stat[rid] = {
+                "text": txt,
+                "decode_ok": bool(txt),
+                "cmc_ok": None,  # None = não aplicável ou pendente
+                "cmc_reason": "",
+                "cmc_detail": ""
+            }
 
-        cmc = self.app.state.cmc
+        with self._lock:
+            self._shared["roi_stat"] = roi_stat
+            self._shared["cmc_needed"] = needs_cmc
+
+        with self._lock:
+            # se vai apontar, o resultado final ainda não está pronto
+            if needs_cmc:
+                self._shared["passed"] = None  # mostra 'aguardando CMC'
+            else:
+                self._shared["passed"] = passed_decode
+
         if not (self._active and self.cmc_enabled.get() and decoded and cmc):
             return
 
@@ -2353,28 +2496,67 @@ class ProductionPage(tk.Frame):
                     return
 
                 seriais = payload_local if isinstance(payload_local, list) else [payload_local]
-
+                all_ok = True
                 for serial in seriais:
                     if (not self._active) or (self._run_id != run_id) or (self._engine is None):
                         return
 
                     resp = cmc.apontar(serial, timeout_s=15)
 
-                    status = (resp or {}).get("status", "SEM_STATUS")
-                    log = (resp or {}).get("log", "")
+                    r = cmc.apontamento_result(resp)
 
-                    if status == "OK":
-                        self.after(0, lambda s=serial: self._hist_add("CMC", f"✅ OK | serial={s}"))
+                    def _upd_roi_stat(serial_local=serial, rr=r):
+                        with self._lock:
+                            roi_stat_local = self._shared.get("roi_stat", {})
+                            for rid, st in roi_stat_local.items():
+                                if st.get("text") == serial_local:
+                                    st["cmc_ok"] = bool(rr.get("ok"))
+                                    st["cmc_reason"] = str(rr.get("reason") or "")
+                                    st["cmc_detail"] = str(rr.get("detail") or "")
+                            self._shared["roi_stat"] = roi_stat_local
+
+                    self.after(0, _upd_roi_stat)
+
+                    if not r["ok"]:
+                        all_ok = False
+                    if r["ok"]:
+                        self.after(0, lambda s=serial, rr=r["reason"]:
+                        self._hist_add("CMC", f"✅ {rr} | serial={s}"))
                     else:
-                        self.after(0, lambda s=serial, st=status, lg=log:
-                        self._hist_add("CMC", f"❌ {st}: {lg} | serial={s}"))
+                        self.after(0, lambda s=serial, rr=r["reason"], dd=r["detail"]:
+                        self._hist_add("CMC", f"❌ {rr}: {dd} | serial={s}"))
 
                     # opcional: pequeno delay pra não saturar (ajuste se precisar)
-                    # time.sleep(0.05)
+                    time.sleep(0.05)
+
+                final_passed = bool(passed_decode and all_ok)
+
+                def _set_final():
+                    with self._lock:
+                        self._shared["passed"] = final_passed
+                        self._shared["cmc_all_ok"] = all_ok
+
+                        # ✅ agora fecha contagem OK/FAIL com resultado final
+                        if final_passed:
+                            self._shared["ok_count"] += 1
+                        else:
+                            self._shared["fail_count"] += 1
+
+                    self._hist_refresh_text()
+
+                self.after(0, _set_final)
 
             except Exception as e:
                 msg = str(e)[:180]
-                self.after(0, lambda m=msg: self._hist_add("CMC", f"❌ Exceção: {m}"))
+
+                def _fail_final():
+                    with self._lock:
+                        self._shared["passed"] = False
+                        self._shared["fail_count"] += 1
+                    self._hist_add("CMC", f"❌ Exceção: {msg}")
+                    self._hist_refresh_text()
+
+                self.after(0, _fail_final)
             finally:
                 self.after(0, self._hist_refresh_text)
 
@@ -2403,7 +2585,7 @@ class ProductionPage(tk.Frame):
             has_bg   = bool(self._shared.get("has_bg", False))
             present  = bool(self._shared.get("present", False))
             codes    = list(self._shared.get("codes", []))
-            dbg_img  = self._shared.get("debug_img")
+            # dbg_img  = self._shared.get("debug_img")
             passed   = self._shared.get("passed")
             state    = self._shared.get("state", "WAIT_PRESENT")
             total    = self._shared.get("total", 0)
@@ -2422,38 +2604,100 @@ class ProductionPage(tk.Frame):
         self._cnt_widgets["fail_count"].config(text=str(fail_c))
 
         if passed is None:
-            self.lbl_result.config(text="AGUARDANDO", fg=MUTED)
+            self.lbl_result.config(text="APONTANDO", fg=MUTED)
             self._status_bar.config(bg=MUTED)
         elif passed:
-            self.lbl_result.config(text="PASSED ✓", fg=GREEN)
+            self.lbl_result.config(text="PASSED", fg=GREEN)
             self._status_bar.config(bg=GREEN)
         else:
-            self.lbl_result.config(text="FAILED ✗", fg=RED)
+            self.lbl_result.config(text="FAILED", fg=RED)
             self._status_bar.config(bg=RED)
 
         for i in self.tree.get_children():
             self.tree.delete(i)
+        roi_stat = {}
+        cmc_needed = False
+        with self._lock:
+            roi_stat = dict(self._shared.get("roi_stat", {}) or {})
+            cmc_needed = bool(self._shared.get("cmc_needed", False))
+
         for r in codes:
-            ok = bool(r.get("text"))
-            self.tree.insert("", "end",
-                values=(f"R{r.get('roi_id',0)}", r.get("text") or "—",
-                        f"{r.get('ms',0):.0f}"),
-                tags=("ok" if ok else "fail",))
+            rid = int(r.get("roi_id", 0))
+            st = roi_stat.get(rid, {})
+            txt = st.get("text") or "—"
+
+            dec_ok = bool(st.get("decode_ok"))
+            dec_str = "OK" if dec_ok else "NOK"
+
+            # apontamento
+            if not cmc_needed:
+                cmc_str = "—"
+                motivo = ""
+                row_ok = dec_ok
+            else:
+                cmc_ok = st.get("cmc_ok", None)
+                if cmc_ok is None:
+                    cmc_str = "..."
+                    motivo = "Aguardando CMControl"
+                    row_ok = False  # ainda não é OK final
+                else:
+                    cmc_str = "OK" if cmc_ok else "NOK"
+                    motivo = (st.get("cmc_reason") or "")
+                    det = (st.get("cmc_detail") or "")
+                    if det and not cmc_ok:
+                        motivo = f"{motivo}: {det}" if motivo else det
+                    row_ok = bool(dec_ok and cmc_ok)
+
+            self.tree.insert(
+                "", "end",
+                values=(f"R{rid}", txt, dec_str, cmc_str, motivo[:120], f"{r.get('ms', 0):.0f}"),
+                tags=("ok" if row_ok else "fail",)
+            )
 
         if frame is not None:
             orig = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR) \
                 if frame.ndim == 2 else frame.copy()
+            roi_stat = {}
+            cmc_needed = False
+            present_now = bool(present)
+
+            with self._lock:
+                roi_stat = dict(self._shared.get("roi_stat", {}) or {})
+                cmc_needed = bool(self._shared.get("cmc_needed", False))
+
             for roi in (self.app.state.rois or []):
-                cv2.polylines(orig, [roi.get_rect_points()], True, (0,255,255), 5)
+                # padrão
+                col = (0, 255, 255)  # ciano
+
+                if present_now:
+                    st = roi_stat.get(int(roi.id), {})
+                    dec_ok = bool(st.get("decode_ok"))
+
+                    if not dec_ok:
+                        col = (0, 0, 255)  # vermelho
+                    else:
+                        if not cmc_needed:
+                            col = (0, 255, 0)  # verde
+                        else:
+                            cmc_ok = st.get("cmc_ok", None)
+                            if cmc_ok is None:
+                                col = (0, 255, 255)  # amarelo (BGR: (0,255,255))
+                            else:
+                                col = (0, 255, 0) if cmc_ok else (0, 0, 255)
+
+                cv2.polylines(orig, [roi.get_rect_points()], True, col, 6)
                 cv2.putText(orig, f"R{roi.id}",
-                            (int(roi.cx)+4, int(roi.cy)-4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+                            (int(roi.cx) + 4, int(roi.cy) - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.85, col, 2)
+                # cv2.putText(orig, f"R{roi.id}",
+                #             (int(roi.cx)+4, int(roi.cy)-4),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
             self._last_bgr = orig
             self._draw_canvas(self.canvas_live, orig, "live")
 
-        if dbg_img is not None:
-            self._last_dbg = dbg_img
-            self._draw_canvas(self.canvas_debug, dbg_img, "dbg")
+        # if dbg_img is not None:
+        #     self._last_dbg = dbg_img
+        #     self._draw_canvas(self.canvas_debug, dbg_img, "dbg")
 
     def _draw_canvas(self, canvas, bgr, which):
         cw = canvas.winfo_width(); ch = canvas.winfo_height()
