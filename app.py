@@ -717,8 +717,7 @@ class MenuPage(tk.Frame):
 
         # 4) regra pedida
         if _env_has_api_creds():
-            if messagebox.askyesno("Sair", "Deseja sair do programa?"):
-                self.app._on_close()  # type: ignore
+            self.app._on_close()  # type: ignore
             return
 
         if messagebox.askyesno("Logout", "Deseja fazer logout do programa?"):
