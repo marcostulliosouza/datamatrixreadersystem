@@ -1094,7 +1094,7 @@ class ConfigPage(tk.Frame):
         self.hold_trigger    = tk.BooleanVar(value=True)
         self.mosaic_cols     = tk.IntVar(value=3)
         self.show_overlay    = tk.BooleanVar(value=True)
-        self.freeze          = tk.BooleanVar(value=False)
+        self.paused          = tk.BooleanVar(value=False)
 
         # ✅ CMC switches (apenas UI)
         self.cmc_enabled     = tk.BooleanVar(value=True)
@@ -1141,7 +1141,7 @@ class ConfigPage(tk.Frame):
         self._img_dbg_tk  = None
         self._last_bgr_orig = None
         self._last_bgr_dbg  = None
-        self._frozen_frame  = None
+        self._paused_frame  = None
         self._project_name  = "novo_projeto"
 
         self._build()
@@ -1182,6 +1182,13 @@ class ConfigPage(tk.Frame):
         eng.on_occupancy = None
         eng.on_state_change = None
 
+        self.paused.set(False)
+        self._paused_frame = None
+        try:
+            self.btn_pause.config(text="⏸  Pause")
+        except Exception:
+            pass
+
         try:
             eng.stop()
         except Exception:
@@ -1195,11 +1202,11 @@ class ConfigPage(tk.Frame):
             self._shared["state"] = "STOPPED"
 
         self.after(0, lambda: _canvas_stop_overlay(self.canvas_original, "STOPPED", "Clique em Iniciar"))
-        self.after(0, lambda: _canvas_stop_overlay(self.canvas_debug, "STOPPED", "Clique em Iniciar"))
-        self.btn_start.set_style("success") # Type: ignore
-        self.btn_start.set_enabled(True) # Type: ignore
-        self.btn_stop.set_style("disabled") # Type: ignore
-        self.btn_stop.set_enabled(False) # Type: ignore
+        # self.after(0, lambda: _canvas_stop_overlay(self.canvas_debug, "STOPPED", "Clique em Iniciar"))
+        # self.btn_start.set_style("success") # Type: ignore
+        # self.btn_start.set_enabled(True) # Type: ignore
+        # self.btn_stop.set_style("disabled") # Type: ignore
+        # self.btn_stop.set_enabled(False) # Type: ignore
 
     # ── SHOW ────────────────────────────────────────────────────
     def on_show(self):
@@ -1225,7 +1232,7 @@ class ConfigPage(tk.Frame):
         _btn(bar, "📂  Carregar",
              command=self.load_project, style="ghost",
              padx=12, pady=5).pack(side="right", padx=2, pady=10)
-        _btn(bar, "🔁  Rearmar",
+        _btn(bar, "🔁  Trigger Manual",
              command=self.rearm, style="warn",
              padx=10, pady=5).pack(side="right", padx=2, pady=10)
 
@@ -1283,12 +1290,14 @@ class ConfigPage(tk.Frame):
         self.btn_start.pack(side="left", padx=8, pady=6)
         self.btn_stop.pack(side="left", padx=4, pady=6)
 
-        self.btn_stop.set_style("disabled") # Type: ignore
-        self.btn_stop.set_enabled(False) #Type: ignore
+        # self.btn_stop.set_style("disabled") # Type: ignore
+        # self.btn_stop.set_enabled(False) #Type: ignore
 
-        for text, var in [("❄ Congelar", self.freeze),
-                          ("Overlay", self.show_overlay)]:
-            _chk(bbar, text, var, bg=BG_PANEL).pack(side="left", padx=10)
+        self.btn_pause = _btn(bbar, "⏸  Pause", command=self.toggle_pause,
+                              style="primary", padx=12, pady=6)
+        self.btn_pause.pack(side="left", padx=8, pady=6)
+
+        _chk(bbar, "Overlay", self.show_overlay, bg=BG_PANEL).pack(side="left", padx=10)
 
         tk.Label(bbar, text="FPS lim:", bg=BG_PANEL,
                  fg=TEXT_DIM, font=FONT_LBL).pack(side="left", padx=(14, 3))
@@ -1316,6 +1325,23 @@ class ConfigPage(tk.Frame):
                                 insertbackground=ACCENT, state="disabled")
         self.txt_hist.pack(fill="x")
         tk.Frame(self.sidebar, bg=BG_DEEP, height=24).pack()
+
+    def toggle_pause(self):
+        now = not bool(self.paused.get())
+        self.paused.set(now)
+
+        if now:
+            # congelar frame atual
+            with self._lock:
+                fr = self._shared.get("frame")
+            self._paused_frame = fr.copy() if isinstance(fr, np.ndarray) else None
+            self.btn_pause.config(text="▶  Resume")
+            self._hist_add("UI", "PAUSE (preview congelado)")
+        else:
+            self._paused_frame = None
+            self.btn_pause.config(text="⏸  Pause")
+            self._hist_add("UI", "RESUME")
+        self._hist_refresh_text()
 
     def _hist_refresh_text(self):
         if not hasattr(self, "txt_hist"):
@@ -1545,10 +1571,10 @@ class ConfigPage(tk.Frame):
             self.engine = None
             return
 
-        self.btn_start.set_style("disabled") # type: ignore
-        self.btn_start.set_enabled(False) # type: ignore
-        self.btn_stop.set_style("danger") # type: ignore
-        self.btn_stop.set_enabled(True)# type: ignore
+        # self.btn_start.set_style("disabled") # type: ignore
+        # self.btn_start.set_enabled(False) # type: ignore
+        # self.btn_stop.set_style("danger") # type: ignore
+        # self.btn_stop.set_enabled(True)# type: ignore
 
     def rearm(self):
         if self.engine:
@@ -2067,6 +2093,14 @@ class ConfigPage(tk.Frame):
         else:
             self._img_dbg_tk = imgtk
 
+        if self.paused.get():
+            c = self.canvas_original
+            w = c.winfo_width()
+            h = c.winfo_height()
+            c.create_rectangle(0, 0, w, 42, fill="#000000", outline="")
+            c.create_text(14, 21, anchor="w", text="PAUSED", fill="#f59e0b",
+                          font=("Segoe UI", 12, "bold"))
+
     # ── UI update loop ────────────────────────────────────────────
     def _schedule_ui(self):
         self._update_ui()
@@ -2086,7 +2120,7 @@ class ConfigPage(tk.Frame):
 
         if frame is None and state_str == "STOPPED":
             _canvas_stop_overlay(self.canvas_original, "STOPPED", "Clique em Iniciar")
-            _canvas_stop_overlay(self.canvas_debug, "STOPPED", "Clique em Iniciar")
+            # _canvas_stop_overlay(self.canvas_debug, "STOPPED", "Clique em Iniciar")
             return
 
         self.lbl_fps.config(text=f"FPS: {fps:.1f}")
@@ -2108,13 +2142,13 @@ class ConfigPage(tk.Frame):
 
         # draw original
         if frame is not None:
-            if self.freeze.get():
-                if self._frozen_frame is None:
-                    self._frozen_frame = frame.copy()
-                draw = self._frozen_frame
+            if self.paused.get():
+                if self._paused_frame is None and frame is not None:
+                    self._paused_frame = frame.copy()
+                draw = self._paused_frame
             else:
                 draw = frame
-                self._frozen_frame = None
+                self._paused_frame = None
 
             # ✅ agora draw nunca será None aqui
             orig = cv2.cvtColor(draw, cv2.COLOR_GRAY2BGR) if draw.ndim == 2 else draw.copy()
@@ -2289,7 +2323,7 @@ class ProductionPage(tk.Frame):
              style="success", padx=12, pady=5).pack(side="right", padx=4, pady=10)
         _btn(bar, "⏹  Parar",   command=self.stop_prod,
              style="danger",  padx=12, pady=5).pack(side="right", padx=4, pady=10)
-        _btn(bar, "🔁  Rearmar", command=self.rearm,
+        _btn(bar, "🔁  Trigger Manual", command=self.rearm,
              style="warn",    padx=10, pady=5).pack(side="right", padx=4, pady=10)
         _btn(bar, "📂  Carregar Projeto", command=self.load_project,
              style="ghost",   padx=10, pady=5).pack(side="right", padx=4, pady=10)
