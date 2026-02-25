@@ -1220,6 +1220,26 @@ class ConfigPage(tk.Frame):
             self.lbl_cmc.config(text="CMC: conectado", fg=YELLOW)
         else:
             self.lbl_cmc.config(text="CMC: offline", fg=TEXT_DIM)
+        with self._lock:
+            self._shared["frame"] = None
+            self._shared["debug_img"] = None
+            self._shared["state"] = "IDLE"
+
+        self.after(0, lambda:
+        _canvas_stop_overlay(
+            self.canvas_original,
+            "MODO CONFIGURAÇÃO",
+            "Clique em INICIAR para ativar a câmera"
+        )
+                   )
+
+        self.after(0, lambda:
+        _canvas_stop_overlay(
+            self.canvas_debug,
+            "DEBUG",
+            "Sem dados ainda"
+        )
+                   )
 
     # ── BUILD ────────────────────────────────────────────────────
     def _build(self):
@@ -2649,8 +2669,25 @@ class ProductionPage(tk.Frame):
 
     def on_show(self):
         pd = self.app.state.project_data
+
         if pd:
-            self.lbl_proj.config(text=f"● {pd.get('project_name','?')}", fg=ACCENT)
+            self.lbl_proj.config(text=f"● {pd.get('project_name', '?')}", fg=ACCENT)
+            msg = "Projeto carregado Clique em INICIAR"
+        else:
+            self.lbl_proj.config(text="Nenhum projeto", fg=TEXT_DIM)
+            msg = "Carregue um projeto antes de iniciar"
+
+        # limpa estado anterior
+        with self._lock:
+            self._shared["frame"] = None
+            self._shared["state"] = "IDLE"
+
+        # desenha mensagem inicial
+        self.after(0, lambda:
+        _canvas_stop_overlay(
+            self.canvas_live,
+            "MODO PRODUÇÃO",
+            msg))
 
     def load_project(self):
         path = filedialog.askopenfilename(
