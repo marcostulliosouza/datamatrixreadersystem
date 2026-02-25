@@ -265,6 +265,19 @@ def _env_has_api_creds() -> bool:
     except Exception:
         return False
 
+def _canvas_stop_overlay(canvas: tk.Canvas, title="STOPPED", subtitle="Clique em Iniciar para voltar"):
+    canvas.delete("all")
+    w = max(2, canvas.winfo_width())
+    h = max(2, canvas.winfo_height())
+
+    # fundo preto
+    canvas.create_rectangle(0, 0, w, h, fill="#000000", outline="")
+
+    # texto central
+    canvas.create_text(w // 2, h // 2 - 18, text=title,
+                       fill="#ffffff", font=("Segoe UI", 36, "bold"))
+    canvas.create_text(w // 2, h // 2 + 22, text=subtitle,
+                       fill="#8892a4", font=("Segoe UI", 12, "bold"))
 
 # ══════════════════════════════════════════════════════════════════
 #  ROI DATACLASS
@@ -335,6 +348,53 @@ class AppState:
 
         self.skip_auto_login_once = False
 
+    def reset_session(self):
+        """Zera tudo que não deve ficar salvo após logout."""
+        self.user = None
+
+        # projeto/produção/config (estado "do último usuário")
+        self.project_path = None
+        self.project_data = None
+        self.rois = []
+
+        self.camera = None
+        self.decoder = None
+        self.panel_detector = None
+
+        self.last_passed = None
+        self.last_codes = []
+        self.last_debug_img = None
+
+        # CMC
+        self.cmc = None
+        self.cmc_ready = False
+
+# ══════════════════════════════════════════════════════════════════
+#  LOG
+# ══════════════════════════════════════════════════════════════════
+class DailyLog:
+    def __init__(self, base_dir="logs"):
+        self.base_dir = base_dir
+        self._lock = threading.Lock()
+        os.makedirs(self.base_dir, exist_ok=True)
+
+    def _path_today(self) -> str:
+        d = datetime.now().strftime("%Y-%m-%d")
+        return os.path.join(self.base_dir, f"{d}.log")
+
+    def write_line(self, line: str):
+        # linha única (sempre com timestamp)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            with open(self._path_today(), "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {line}\n")
+
+    def write_block(self, title: str, lines: list[str]):
+        self.write_line(f"--- {title} ---")
+        for ln in lines:
+            self.write_line(ln)
+        self.write_line(f"--- /{title} ---")
+
 # ══════════════════════════════════════════════════════════════════
 #  ROUTER
 # ══════════════════════════════════════════════════════════════════
@@ -391,13 +451,14 @@ class App(tk.Tk):
 
     def _on_close(self):
         # fecha cmc no exit do app
-        if self.state.cmc:
-            try:
-                self.state.cmc.disconnect()
-            except Exception:
-                pass
-            self.state.cmc = None
-        self.destroy()
+        if messagebox.askyesno("Fechar", "Deseja fechar o programa?"):
+            if self.state.cmc:
+                try:
+                    self.state.cmc.disconnect()
+                except Exception:
+                    pass
+                self.state.cmc = None
+            self.destroy()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -525,10 +586,14 @@ class LoginPage(tk.Frame):
             self.app.show("MenuPage")
 
     def on_show(self):
-        # ✅ se alguém pediu pra abrir login sem auto-login (ex: logout)
+        # ✅ se veio de logout: não auto-logar e limpa campos
         if getattr(self.app.state, "skip_auto_login_once", False):
             self.app.state.skip_auto_login_once = False
+
+            self.var_user.set("")
+            self.var_pass.set("")
             self.lbl_err.config(text="")
+            self.update_idletasks()
             return
 
         # auto-login normal se env tiver credenciais
@@ -548,6 +613,11 @@ class LoginPage(tk.Frame):
             if self._try_login(u, p):
                 self.lbl_err.config(text="")
                 self.app.show("MenuPage")
+        else:
+            # se não tem env, deixa tela limpa
+            self.var_user.set("")
+            self.var_pass.set("")
+            self.lbl_err.config(text="")
 
 # ══════════════════════════════════════════════════════════════════
 #  MENU
@@ -628,11 +698,10 @@ class MenuPage(tk.Frame):
 
     def on_show(self):
         u = self.app.state.user
-        if u:
-            self.lbl_user.config(text=f"●  {u['username']}")
+        self.lbl_user.config(text=f"●  {u['username']}" if u else "")
 
     def logout(self):
-        # sempre desconecta primeiro
+        # 1) desconecta cmc
         cmc = self.app.state.cmc
         if cmc:
             try:
@@ -640,17 +709,20 @@ class MenuPage(tk.Frame):
             except Exception:
                 pass
 
-        self.app.state.cmc = None
-        self.app.state.cmc_ready = False
-        self.app.state.user = None
+        # 2) zera sessão inteira
+        self.app.state.reset_session()
 
-        # ✅ regra pedida:
-        # - se tiver credencial no env => SAIR do programa
-        # - se não tiver => voltar para login
+        # 3) limpa o label do menu (evita “ficar o último” se voltar pra tela)
+        self.lbl_user.config(text="")
+
+        # 4) regra pedida
         if _env_has_api_creds():
             if messagebox.askyesno("Sair", "Deseja sair do programa?"):
-                self.app._on_close() #Type: ignore
-        else:
+                self.app._on_close()  # type: ignore
+            return
+
+        if messagebox.askyesno("Logout", "Deseja fazer logout do programa?"):
+            # impede auto-login logo após logout
             self.app.state.skip_auto_login_once = True
             self.app.show("LoginPage")
 
@@ -1090,7 +1162,7 @@ class ConfigPage(tk.Frame):
 
     def _hist_dump(self):
         with self._lock:
-            return "\n".join(self._hist)
+            return "\n".join([f"[{ts}] {tag}: {msg}" for ts, tag, msg in self._hist])
 
     def on_hide(self):
         # para engine/camera
@@ -1116,6 +1188,14 @@ class ConfigPage(tk.Frame):
             pass
 
         self.engine = None
+        with self._lock:
+            self._shared["frame"] = None
+            self._shared["debug_img"] = None
+            self._shared["passed"] = None
+            self._shared["state"] = "STOPPED"
+
+        self.after(0, lambda: _canvas_stop_overlay(self.canvas_original, "STOPPED", "Clique em Iniciar"))
+        self.after(0, lambda: _canvas_stop_overlay(self.canvas_debug, "STOPPED", "Clique em Iniciar"))
         self.btn_start.set_style("success") # Type: ignore
         self.btn_start.set_enabled(True) # Type: ignore
         self.btn_stop.set_style("disabled") # Type: ignore
@@ -1567,8 +1647,10 @@ class ConfigPage(tk.Frame):
             # se vai apontar, o resultado final ainda não está pronto
             if needs_cmc:
                 self._shared["passed"] = None  # mostra "aguardando CMC"
+                self._shared["pending_final"] = True
             else:
                 self._shared["passed"] = passed_decode
+                self._shared["pending_final"] = False
 
         self._hist_add("TRG", f"{'PASS' if passed else 'FAIL'} | codes={len(decoded)} | {dec_ms:.0f}ms")
         self.after(0, self._hist_refresh_text)
@@ -1622,10 +1704,12 @@ class ConfigPage(tk.Frame):
                 final_passed = bool(passed_decode and all_ok)
 
                 def _set_final():
-                    with self._lock:
-                        self._shared["passed"] = final_passed
-                        self._shared["cmc_all_ok"] = all_ok
-                    self._hist_refresh_text()
+                    if self._shared.get("pending_final", False):
+                        if final_passed:
+                            self._shared["ok_count"] += 1
+                        else:
+                            self._shared["fail_count"] += 1
+                        self._shared["pending_final"] = False
                 self.after(0, _set_final)
 
             except Exception as e:
@@ -1779,7 +1863,6 @@ class ConfigPage(tk.Frame):
         messagebox.showinfo("Carregado", f"✅ {self._project_name} carregado.")
 
     # ── ROI helpers ──────────────────────────────────────────────
-
 
     def _next_roi_id(self):
         return max([r.id for r in self.rois], default=0) + 1
@@ -2001,6 +2084,11 @@ class ConfigPage(tk.Frame):
             passed    = self._shared.get("passed")
             state_str = self._shared.get("state", "WAIT_PRESENT")
 
+        if frame is None and state_str == "STOPPED":
+            _canvas_stop_overlay(self.canvas_original, "STOPPED", "Clique em Iniciar")
+            _canvas_stop_overlay(self.canvas_debug, "STOPPED", "Clique em Iniciar")
+            return
+
         self.lbl_fps.config(text=f"FPS: {fps:.1f}")
         self.lbl_dec.config(text=f"Decode: {dec_ms:.0f} ms")
         self.lbl_state.config(text=f"State: {state_str}")
@@ -2127,11 +2215,18 @@ class ProductionPage(tk.Frame):
 
         self._hist = deque(maxlen=600)
 
+        self._log = DailyLog(base_dir="logs")
+
     def _hist_add(self, level: str, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] [{level}] {msg}"
         with self._lock:
             self._hist.append(line)
+
+        # log em arquivo por data
+        u = (self.app.state.user or {}).get("username", "—")
+        proj = (self.app.state.project_data or {}).get("project_name", "—")
+        self._log.write_line(f"HIST | user={u} | project={proj} | {line}")
 
     def _hist_refresh_text(self):
         with self._lock:
@@ -2160,6 +2255,14 @@ class ProductionPage(tk.Frame):
         eng.on_occupancy = None
         eng.on_state_change = None
 
+        u = (self.app.state.user or {}).get("username", "—")
+        proj = (self.app.state.project_data or {}).get("project_name", "—")
+        with self._lock:
+            okc = self._shared.get("ok_count", 0)
+            failc = self._shared.get("fail_count", 0)
+            total = self._shared.get("total", 0)
+        self._log.write_line(f"SESSION END | user={u} | project={proj} | total={total} ok={okc} fail={failc}")
+
         try:
             eng.stop()
         except Exception:
@@ -2167,6 +2270,15 @@ class ProductionPage(tk.Frame):
 
         self._engine = None
         self._cam_dot.config(fg=MUTED)
+
+        # limpa frame e desenha overlay STOP
+        with self._lock:
+            self._shared["frame"] = None
+            self._shared["codes"] = []
+            self._shared["passed"] = None
+            self._shared["state"] = "STOPPED"
+
+        self.after(0, lambda: _canvas_stop_overlay(self.canvas_live, "STOPPED", "Carregue projeto / clique em Iniciar"))
 
     def _build(self):
         bar = _topbar(self, "MODO PRODUÇÃO",
@@ -2284,6 +2396,8 @@ class ProductionPage(tk.Frame):
         cols = ("ROI", "Código", "Decode", "Apont.", "Motivo", "ms")
         self.tree = ttk.Treeview(tbl_body, columns=cols, show="headings", height=8)
 
+        self.tree.bind("<Double-Button-1>", lambda e: self.open_readings_popup())
+
         self.tree.heading("ROI", text="ROI")
         self.tree.heading("Código", text="Código")
         self.tree.heading("Decode", text="Decode")
@@ -2304,11 +2418,196 @@ class ProductionPage(tk.Frame):
         self.tree.tag_configure("ok",   foreground=GREEN)
         self.tree.tag_configure("fail", foreground=RED)
 
+        actions = tk.Frame(tbl_body, bg=BG_CARD)
+        actions.pack(fill="x", pady=(0, 6))
+
+        _btn(actions, "🔎 Expandir", command=self.open_readings_popup,
+             style="ghost", padx=10, pady=5).pack(side="left")
+
+        _btn(actions, "📋 Copiar", command=self.copy_readings_text,
+             style="ghost", padx=10, pady=5).pack(side="left", padx=6)
+
+        _btn(actions, "💾 Exportar .txt", command=self.export_readings_txt,
+             style="primary", padx=10, pady=5).pack(side="right")
+
         hist_body = _section(right, "HISTÓRICO")
+        h_actions = tk.Frame(hist_body, bg=BG_CARD)
+        h_actions.pack(fill="x", pady=(0, 6))
+
+        _btn(h_actions, "🔎 Expandir", command=self.open_history_popup,
+             style="ghost", padx=10, pady=5).pack(side="left")
+
+        _btn(h_actions, "📋 Copiar", command=self.copy_history_text,
+             style="ghost", padx=10, pady=5).pack(side="left", padx=6)
+
+        _btn(h_actions, "💾 Exportar .txt", command=self.export_history_txt,
+             style="primary", padx=10, pady=5).pack(side="right")
         self.txt_hist = tk.Text(hist_body, height=8, bg=BG_CARD, fg=TEXT_SEC,
                                 font=FONT_MONO, relief="flat",
                                 insertbackground=ACCENT, state="disabled")
         self.txt_hist.pack(fill="x")
+
+    def _readings_rows(self):
+        # retorna uma lista de tuplas igual ao que você mostra na tree
+        with self._lock:
+            codes = list(self._shared.get("codes", []))
+            roi_stat = dict(self._shared.get("roi_stat", {}) or {})
+            cmc_needed = bool(self._shared.get("cmc_needed", False))
+
+        rows = []
+        for r in codes:
+            rid = int(r.get("roi_id", 0))
+            st = roi_stat.get(rid, {})
+            txt = st.get("text") or "—"
+
+            dec_ok = bool(st.get("decode_ok"))
+            dec_str = "OK" if dec_ok else "NOK"
+
+            if not cmc_needed:
+                cmc_str = "—"
+                motivo = ""
+            else:
+                cmc_ok = st.get("cmc_ok", None)
+                if cmc_ok is None:
+                    cmc_str = "..."
+                    motivo = "Aguardando CMControl"
+                else:
+                    cmc_str = "OK" if cmc_ok else "NOK"
+                    motivo = (st.get("cmc_reason") or "")
+                    det = (st.get("cmc_detail") or "")
+                    if det and not cmc_ok:
+                        motivo = f"{motivo}: {det}" if motivo else det
+
+            ms = f"{float(r.get('ms', 0)):.0f}"
+            rows.append((f"R{rid}", txt, dec_str, cmc_str, motivo, ms))
+        return rows
+
+    def _readings_text(self) -> str:
+        rows = self._readings_rows()
+        if not rows:
+            return "Sem dados do último trigger.\n"
+
+        header = ["ROI", "Código", "Decode", "Apont.", "Motivo", "ms"]
+        lines = ["\t".join(header)]
+        for row in rows:
+            lines.append("\t".join([str(x) for x in row]))
+        return "\n".join(lines) + "\n"
+
+    def copy_readings_text(self):
+        text = self._readings_text()
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    def export_readings_txt(self):
+        text = self._readings_text()
+        path = filedialog.asksaveasfilename(
+            title="Exportar leituras do último trigger",
+            defaultextension=".txt",
+            filetypes=[("TXT", "*.txt")],
+            initialfile=f"leituras_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+        )
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        messagebox.showinfo("Exportado", f"✅ Arquivo salvo:\n{path}")
+
+    def open_readings_popup(self):
+        win = tk.Toplevel(self)
+        win.title("Leituras — Último trigger (Expandido)")
+        win.geometry("1100x650")
+        win.configure(bg=BG_DEEP)
+
+        top = tk.Frame(win, bg=BG_PANEL, highlightbackground=BORDER_LT, highlightthickness=1)
+        top.pack(fill="x")
+
+        tk.Label(top, text="Leituras — Último trigger", bg=BG_PANEL, fg=TEXT_PRI,
+                 font=("Segoe UI", 11, "bold")).pack(side="left", padx=12, pady=10)
+
+        _btn(top, "📋 Copiar", command=lambda: (win.clipboard_clear(), win.clipboard_append(self._readings_text())),
+             style="ghost", padx=10, pady=5).pack(side="right", padx=6, pady=8)
+
+        _btn(top, "💾 Exportar .txt", command=self.export_readings_txt,
+             style="primary", padx=10, pady=5).pack(side="right", padx=6, pady=8)
+
+        # tabela grande
+        body = tk.Frame(win, bg=BG_DEEP, padx=10, pady=10)
+        body.pack(fill="both", expand=True)
+
+        cols = ("ROI", "Código", "Decode", "Apont.", "Motivo", "ms")
+        tv = ttk.Treeview(body, columns=cols, show="headings")
+        for c in cols:
+            tv.heading(c, text=c)
+
+        tv.column("ROI", width=70, anchor="center")
+        tv.column("Código", width=260, anchor="w")
+        tv.column("Decode", width=90, anchor="center")
+        tv.column("Apont.", width=90, anchor="center")
+        tv.column("Motivo", width=470, anchor="w")
+        tv.column("ms", width=80, anchor="center")
+
+        scr = ttk.Scrollbar(body, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=scr.set)
+        tv.pack(side="left", fill="both", expand=True)
+        scr.pack(side="right", fill="y")
+
+        # popula com os dados atuais
+        for row in self._readings_rows():
+            tv.insert("", "end", values=row)
+
+    def _history_text(self) -> str:
+        with self._lock:
+            return "\n".join(list(self._hist)) + ("\n" if len(self._hist) else "")
+
+    def copy_history_text(self):
+        text = self._history_text()
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    def export_history_txt(self):
+        text = self._history_text()
+        path = filedialog.asksaveasfilename(
+            title="Exportar histórico",
+            defaultextension=".txt",
+            filetypes=[("TXT", "*.txt")],
+            initialfile=f"historico_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+        )
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        messagebox.showinfo("Exportado", f"✅ Arquivo salvo:\n{path}")
+
+    def open_history_popup(self):
+        win = tk.Toplevel(self)
+        win.title("Histórico (Expandido)")
+        win.geometry("1100x650")
+        win.configure(bg=BG_DEEP)
+
+        top = tk.Frame(win, bg=BG_PANEL, highlightbackground=BORDER_LT, highlightthickness=1)
+        top.pack(fill="x")
+
+        tk.Label(top, text="Histórico", bg=BG_PANEL, fg=TEXT_PRI,
+                 font=("Segoe UI", 11, "bold")).pack(side="left", padx=12, pady=10)
+
+        _btn(top, "📋 Copiar", command=lambda: (win.clipboard_clear(), win.clipboard_append(self._history_text())),
+             style="ghost", padx=10, pady=5).pack(side="right", padx=6, pady=8)
+
+        _btn(top, "💾 Exportar .txt", command=self.export_history_txt,
+             style="primary", padx=10, pady=5).pack(side="right", padx=6, pady=8)
+
+        body = tk.Frame(win, bg=BG_DEEP, padx=10, pady=10)
+        body.pack(fill="both", expand=True)
+
+        txt = tk.Text(body, bg=BG_CARD, fg=TEXT_SEC, font=FONT_MONO,
+                      relief="flat", insertbackground=ACCENT)
+        scr = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=scr.set)
+
+        txt.pack(side="left", fill="both", expand=True)
+        scr.pack(side="right", fill="y")
+
+        txt.insert("1.0", self._history_text())
 
     def _go_menu(self):
         self.stop_prod()
@@ -2337,6 +2636,9 @@ class ProductionPage(tk.Frame):
 
         self.lbl_proj.config(text=f"● {data.get('project_name','?')}", fg=ACCENT)
         messagebox.showinfo("Projeto", f"✅ {data.get('project_name')} carregado.")
+        u = (self.app.state.user or {}).get("username", "—")
+        proj = data.get("project_name", "—")
+        self._log.write_line(f"PROJECT LOADED | user={u} | project={proj} | path={path}")
 
     def _build_engine_from_project(self) -> Optional[Engine]:
         data = self.app.state.project_data
@@ -2408,6 +2710,9 @@ class ProductionPage(tk.Frame):
             self._active = True
             self._run_id += 1
             self._cam_dot.config(fg=GREEN)
+            u = (self.app.state.user or {}).get("username", "—")
+            proj = (self.app.state.project_data or {}).get("project_name", "—")
+            self._log.write_line(f"SESSION START | user={u} | project={proj}")
 
     def rearm(self):
         if self._engine:
@@ -2436,14 +2741,14 @@ class ProductionPage(tk.Frame):
             self._shared["debug_img"] = dbg_img
             self._shared["dec_ms"] = dec_ms
 
-            # TOTAL sempre conta trigger
             self._shared["total"] += 1
 
-            # ✅ contadores OK/FAIL só fecham quando resultado final está definido
             if needs_cmc:
-                self._shared["passed"] = None  # apontando...
+                self._shared["passed"] = None
+                self._shared["pending_final"] = True
             else:
                 self._shared["passed"] = passed_decode
+                self._shared["pending_final"] = False
                 if passed_decode:
                     self._shared["ok_count"] += 1
                 else:
@@ -2462,16 +2767,48 @@ class ProductionPage(tk.Frame):
                 "cmc_detail": ""
             }
 
+        u = (self.app.state.user or {}).get("username", "—")
+        proj = (self.app.state.project_data or {}).get("project_name", "—")
+
         with self._lock:
             self._shared["roi_stat"] = roi_stat
             self._shared["cmc_needed"] = needs_cmc
 
-        with self._lock:
-            # se vai apontar, o resultado final ainda não está pronto
-            if needs_cmc:
-                self._shared["passed"] = None  # mostra 'aguardando CMC'
-            else:
-                self._shared["passed"] = passed_decode
+            total = int(self._shared.get("total", 0))
+            okc = int(self._shared.get("ok_count", 0))
+            failc = int(self._shared.get("fail_count", 0))
+            cmc_needed = bool(self._shared.get("cmc_needed", False))
+            roi_stat_snap = dict(self._shared.get("roi_stat", {}) or {})
+
+            lines = []
+            lines.append(
+                f"user={u} | project={proj} | trigger_total={total} | ok={okc} fail={failc} | cmc_needed={cmc_needed}")
+            lines.append(f"decode_passed={bool(passed_decode)} | decoded_codes={len(decoded)}")
+
+            # detalhe por ROI
+            for rid in sorted(roi_stat_snap.keys()):
+                st = roi_stat_snap[rid]
+                txt = st.get("text") or "—"
+                dec_ok = st.get("decode_ok")
+                cmc_ok = st.get("cmc_ok")
+                reason = (st.get("cmc_reason") or "")
+                detail = (st.get("cmc_detail") or "")
+
+                if not dec_ok:
+                    lines.append(f"ROI {rid}: DECODE=NOK | code={txt}")
+                else:
+                    if not cmc_needed:
+                        lines.append(f"ROI {rid}: DECODE=OK | CMC=— | code={txt}")
+                    else:
+                        if cmc_ok is None:
+                            lines.append(f"ROI {rid}: DECODE=OK | CMC=PENDING | code={txt}")
+                        elif cmc_ok:
+                            lines.append(f"ROI {rid}: DECODE=OK | CMC=OK | code={txt} | reason={reason}")
+                        else:
+                            lines.append(
+                                f"ROI {rid}: DECODE=OK | CMC=NOK | code={txt} | reason={reason} | detail={detail}")
+
+            self._log.write_block("TRIGGER", lines)
 
         if not (self._active and self.cmc_enabled.get() and decoded and cmc):
             return
@@ -2528,19 +2865,44 @@ class ProductionPage(tk.Frame):
 
                     # opcional: pequeno delay pra não saturar (ajuste se precisar)
                     time.sleep(0.05)
+                with self._lock:
+                    roi_stat_final = dict(self._shared.get("roi_stat", {}) or {})
 
                 final_passed = bool(passed_decode and all_ok)
+
+                lines = [f"user={u} | project={proj} | all_ok={all_ok} | final_passed={final_passed}"]
+                for rid in sorted(roi_stat_final.keys()):
+                    st = roi_stat_final[rid]
+                    code = st.get("text") or "—"
+                    dec_ok = bool(st.get("decode_ok"))
+                    cmc_ok = st.get("cmc_ok", None)
+                    reason = st.get("cmc_reason") or ""
+                    detail = st.get("cmc_detail") or ""
+
+                    if not dec_ok:
+                        lines.append(f"ROI {rid}: DECODE=NOK | code={code}")
+                    else:
+                        if cmc_ok is None:
+                            lines.append(f"ROI {rid}: DECODE=OK | CMC=? | code={code}")
+                        elif cmc_ok:
+                            lines.append(f"ROI {rid}: DECODE=OK | CMC=OK | code={code} | reason={reason}")
+                        else:
+                            lines.append(
+                                f"ROI {rid}: DECODE=OK | CMC=NOK | code={code} | reason={reason} | detail={detail}")
+
+                self._log.write_block("CMC_FINAL", lines)
 
                 def _set_final():
                     with self._lock:
                         self._shared["passed"] = final_passed
                         self._shared["cmc_all_ok"] = all_ok
 
-                        # ✅ agora fecha contagem OK/FAIL com resultado final
-                        if final_passed:
-                            self._shared["ok_count"] += 1
-                        else:
-                            self._shared["fail_count"] += 1
+                        if self._shared.get("pending_final", False):
+                            if final_passed:
+                                self._shared["ok_count"] += 1
+                            else:
+                                self._shared["fail_count"] += 1
+                            self._shared["pending_final"] = False
 
                     self._hist_refresh_text()
 
@@ -2552,7 +2914,11 @@ class ProductionPage(tk.Frame):
                 def _fail_final():
                     with self._lock:
                         self._shared["passed"] = False
-                        self._shared["fail_count"] += 1
+
+                        if self._shared.get("pending_final", False):
+                            self._shared["fail_count"] += 1
+                            self._shared["pending_final"] = False
+
                     self._hist_add("CMC", f"❌ Exceção: {msg}")
                     self._hist_refresh_text()
 
@@ -2591,6 +2957,16 @@ class ProductionPage(tk.Frame):
             total    = self._shared.get("total", 0)
             ok_c     = self._shared.get("ok_count", 0)
             fail_c   = self._shared.get("fail_count", 0)
+
+            frame = self._shared.get("frame")
+            state = self._shared.get("state", "WAIT_PRESENT")
+
+        if frame is None and state == "STOPPED":
+            _canvas_stop_overlay(self.canvas_live, "STOPPED", "Clique em Iniciar para voltar")
+            # opcional: limpa tabela para não confundir
+            for i in self.tree.get_children():
+                self.tree.delete(i)
+            return
 
         self.lbl_fps.config(text=f"{fps:.0f} FPS")
         self.lbl_dec.config(text=f"Decode: {dec_ms:.0f} ms")
